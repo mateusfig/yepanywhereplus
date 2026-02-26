@@ -110,6 +110,16 @@ Yep Anywhere uses the official [`@anthropic-ai/claude-agent-sdk`](https://www.np
 
 Read more: [How we use the SDK](https://yepanywhere.com/tos-compliance.html) | [Feb 2026 auth clarification](https://yepanywhere.com/sdk-auth-clarification.html)
 
+## Star History
+
+<a href="https://www.star-history.com/#kzahel/yepanywhere&type=date&legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=kzahel/yepanywhere&type=date&legend=top-left&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=kzahel/yepanywhere&type=date&legend=top-left" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=kzahel/yepanywhere&type=date&legend=top-left" />
+  </picture>
+</a>
+
 ## License
 
 MIT
