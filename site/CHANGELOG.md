@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [site-v1.5.17] - 2026-02-27
+
+### Added
+- New article: "What I Learned from the OpenClaw Guy's AI Coding Workflow"
+- All news items now expanded by default on news page
+
 ## [site-v1.5.16] - 2026-02-25
 
 ### Fixed
