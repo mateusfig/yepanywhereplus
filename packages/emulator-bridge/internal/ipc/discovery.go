@@ -3,8 +3,11 @@ package ipc
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
 // EmulatorInfo describes a discovered Android emulator.
@@ -147,33 +150,81 @@ func (d *Discovery) getAVDName(serial string) string {
 	}
 	port := parts[1]
 
-	conn, err := net.DialTimeout("tcp", "localhost:"+port, 2e9) // 2 second timeout
+	conn, err := net.DialTimeout("tcp", "localhost:"+port, 2*time.Second)
 	if err != nil {
 		return serial
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
 
-	// Read the greeting.
-	buf := make([]byte, 1024)
-	conn.Read(buf)
+	// Read the greeting (may require multiple reads).
+	greeting := readUntilOK(conn)
+
+	// The console requires authentication. Read the auth token and authenticate.
+	tokenPath := consoleAuthTokenPath(greeting)
+	if tokenPath != "" {
+		token, err := os.ReadFile(tokenPath)
+		if err != nil {
+			return serial
+		}
+		fmt.Fprintf(conn, "auth %s\n", strings.TrimSpace(string(token)))
+		readUntilOK(conn) // consume auth response
+	}
 
 	// Send "avd name" command.
 	fmt.Fprintf(conn, "avd name\n")
 
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return serial
-	}
-
-	// Parse response: first line is the AVD name.
-	response := string(buf[:n])
-	lines := strings.Split(strings.TrimSpace(response), "\n")
-	if len(lines) > 0 {
-		name := strings.TrimSpace(lines[0])
+	response := readUntilOK(conn)
+	for _, line := range strings.Split(response, "\n") {
+		name := strings.TrimSpace(line)
 		if name != "" && name != "OK" {
 			return name
 		}
 	}
 
 	return serial
+}
+
+// readUntilOK reads from the connection until it sees a line starting with "OK" or an error.
+func readUntilOK(conn net.Conn) string {
+	var sb strings.Builder
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			sb.Write(buf[:n])
+			if strings.Contains(sb.String(), "\nOK") || strings.HasPrefix(sb.String(), "OK") {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return sb.String()
+}
+
+// consoleAuthTokenPath extracts the auth token file path from the console greeting.
+// The greeting typically contains: "you can find your <auth_token> in '/path/to/token'"
+func consoleAuthTokenPath(greeting string) string {
+	// Look for the token path in the greeting
+	if idx := strings.Index(greeting, "emulator_console_auth_token"); idx != -1 {
+		// Walk backward to find the start of the path (after "in '")
+		start := strings.LastIndex(greeting[:idx], "'")
+		end := strings.Index(greeting[idx:], "'")
+		if start >= 0 && end >= 0 {
+			return greeting[start+1 : idx+end]
+		}
+	}
+
+	// Fallback: try the default location
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(home, ".emulator_console_auth_token")
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return ""
 }
