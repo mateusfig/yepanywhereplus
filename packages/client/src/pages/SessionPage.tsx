@@ -460,6 +460,7 @@ function SessionPageContent({
         thinking,
         true, // deferred
       );
+      removePendingMessage(tempId);
       draftControlsRef.current?.clearDraft();
     } catch (err) {
       console.error("Failed to queue deferred message:", err);
