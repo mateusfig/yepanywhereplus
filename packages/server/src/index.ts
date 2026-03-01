@@ -399,11 +399,14 @@ async function startServer() {
   // Seed allowed hosts middleware from persisted settings
   updateAllowedHosts(serverSettingsService.getSetting("allowedHosts"));
 
-  // Seed Ollama URL from persisted settings
+  // Seed Ollama settings from persisted settings
   const savedOllamaUrl = serverSettingsService.getSetting("ollamaUrl");
   if (savedOllamaUrl) {
     ClaudeOllamaProvider.setOllamaUrl(savedOllamaUrl);
   }
+  ClaudeOllamaProvider.setSystemPrompt(
+    serverSettingsService.getSetting("ollamaSystemPrompt"),
+  );
 
   // Log auth status
   if (config.authDisabled) {

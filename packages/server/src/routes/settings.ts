@@ -23,6 +23,8 @@ export interface SettingsRoutesDeps {
   ) => Promise<void> | void;
   /** Callback to apply Ollama URL changes at runtime */
   onOllamaUrlChanged?: (url: string | undefined) => void;
+  /** Callback to apply Ollama system prompt changes at runtime */
+  onOllamaSystemPromptChanged?: (prompt: string | undefined) => void;
 }
 
 function parseExecutorList(rawExecutors: unknown[]): {
@@ -53,6 +55,7 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
     onAllowedHostsChanged,
     onRemoteSessionPersistenceChanged,
     onOllamaUrlChanged,
+    onOllamaSystemPromptChanged,
   } = deps;
 
   /**
@@ -134,6 +137,19 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
       }
     }
 
+    // Handle ollamaSystemPrompt string (free-form text, or undefined/null/"" to clear)
+    if ("ollamaSystemPrompt" in body) {
+      if (
+        body.ollamaSystemPrompt === undefined ||
+        body.ollamaSystemPrompt === null ||
+        body.ollamaSystemPrompt === ""
+      ) {
+        updates.ollamaSystemPrompt = undefined;
+      } else if (typeof body.ollamaSystemPrompt === "string") {
+        updates.ollamaSystemPrompt = body.ollamaSystemPrompt.slice(0, 10000);
+      }
+    }
+
     if (Object.keys(updates).length === 0) {
       return c.json({ error: "At least one valid setting is required" }, 400);
     }
@@ -154,6 +170,9 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
     }
     if ("ollamaUrl" in updates && onOllamaUrlChanged) {
       onOllamaUrlChanged(settings.ollamaUrl);
+    }
+    if ("ollamaSystemPrompt" in updates && onOllamaSystemPromptChanged) {
+      onOllamaSystemPromptChanged(settings.ollamaSystemPrompt);
     }
 
     return c.json({ settings });

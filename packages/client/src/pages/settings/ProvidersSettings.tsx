@@ -3,6 +3,9 @@ import { useProviders } from "../../hooks/useProviders";
 import { useServerSettings } from "../../hooks/useServerSettings";
 import { getAllProviders } from "../../providers/registry";
 
+const DEFAULT_OLLAMA_SYSTEM_PROMPT =
+  "You are a helpful coding assistant. You help users with software engineering tasks. You have access to tools for reading files, editing files, running shell commands, and searching code. Use tools when needed to answer questions or make changes. Be concise and direct.";
+
 function OllamaUrlInput() {
   const { settings, updateSetting } = useServerSettings();
   const [url, setUrl] = useState("");
@@ -61,6 +64,68 @@ function OllamaUrlInput() {
   );
 }
 
+function OllamaSystemPromptInput() {
+  const { settings, updateSetting } = useServerSettings();
+  const [prompt, setPrompt] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+  const [hasChanges, setHasChanges] = useState(false);
+
+  const serverValue = settings?.ollamaSystemPrompt ?? "";
+
+  useEffect(() => {
+    if (settings) {
+      setPrompt(settings.ollamaSystemPrompt ?? "");
+    }
+  }, [settings]);
+
+  const handleSave = useCallback(async () => {
+    setIsSaving(true);
+    try {
+      await updateSetting("ollamaSystemPrompt", prompt.trim() || undefined);
+      setHasChanges(false);
+    } catch {
+      // Error handled by useServerSettings
+    } finally {
+      setIsSaving(false);
+    }
+  }, [prompt, updateSetting]);
+
+  return (
+    <div style={{ marginTop: "var(--space-2)", width: "100%" }}>
+      <textarea
+        className="settings-textarea"
+        value={prompt}
+        onChange={(e) => {
+          setPrompt(e.target.value);
+          setHasChanges(e.target.value !== serverValue);
+        }}
+        placeholder={DEFAULT_OLLAMA_SYSTEM_PROMPT}
+        rows={4}
+      />
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginTop: "var(--space-2)",
+        }}
+      >
+        <span className="settings-hint">
+          System prompt for Ollama models. Leave empty for default.
+        </span>
+        <button
+          type="button"
+          className="settings-button"
+          disabled={!hasChanges || isSaving}
+          onClick={handleSave}
+        >
+          {isSaving ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function ProvidersSettings() {
   const { providers: serverProviders, loading: providersLoading } =
     useProviders();
@@ -108,7 +173,12 @@ export function ProvidersSettings() {
                   ))}
                 </ul>
               )}
-              {provider.id === "claude-ollama" && <OllamaUrlInput />}
+              {provider.id === "claude-ollama" && (
+                <>
+                  <OllamaUrlInput />
+                  <OllamaSystemPromptInput />
+                </>
+              )}
             </div>
             {provider.metadata.website && (
               <a

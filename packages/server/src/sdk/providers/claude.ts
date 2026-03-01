@@ -160,6 +160,26 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   /**
+   * Build the systemPrompt option for the SDK query.
+   * Default: use the full claude_code preset. Subclasses (e.g., Ollama) can
+   * override to provide a simpler prompt that smaller models can follow.
+   */
+  protected getSystemPrompt(
+    globalInstructions?: string,
+  ):
+    | string
+    | { type: "preset"; preset: "claude_code"; append?: string }
+    | undefined {
+    return globalInstructions
+      ? {
+          type: "preset" as const,
+          preset: "claude_code" as const,
+          append: globalInstructions,
+        }
+      : { type: "preset" as const, preset: "claude_code" as const };
+  }
+
+  /**
    * Probe for available models by starting a minimal session.
    * The session doesn't send any messages - it just calls supportedModels()
    * on the SDK query and then aborts.
@@ -355,13 +375,7 @@ export class ClaudeProvider implements AgentProvider {
               ? "default"
               : (options.permissionMode ?? "default"),
           canUseTool,
-          systemPrompt: options.globalInstructions
-            ? {
-                type: "preset" as const,
-                preset: "claude_code" as const,
-                append: options.globalInstructions,
-              }
-            : { type: "preset" as const, preset: "claude_code" as const },
+          systemPrompt: this.getSystemPrompt(options.globalInstructions),
           settingSources: ["user", "project", "local"],
           includePartialMessages: true,
           // Model, thinking, and effort options

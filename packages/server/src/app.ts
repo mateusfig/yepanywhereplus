@@ -576,6 +576,9 @@ export function createApp(options: AppOptions): AppResult {
             ClaudeOllamaProvider.setOllamaUrl(url);
           }
         },
+        onOllamaSystemPromptChanged: (prompt) => {
+          ClaudeOllamaProvider.setSystemPrompt(prompt);
+        },
       }),
     );
   }

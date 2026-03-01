@@ -33,6 +33,9 @@ export class ClaudeOllamaProvider extends ClaudeProvider {
   /** Configurable Ollama URL. Defaults to OLLAMA_URL env or localhost:11434. */
   private static ollamaUrl = process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL;
 
+  /** Custom system prompt override (undefined = use default minimal prompt). */
+  private static customSystemPrompt: string | undefined;
+
   /**
    * Update the Ollama URL at runtime (called from settings route).
    */
@@ -45,6 +48,13 @@ export class ClaudeOllamaProvider extends ClaudeProvider {
    */
   static getOllamaUrl(): string {
     return ClaudeOllamaProvider.ollamaUrl;
+  }
+
+  /**
+   * Update the custom system prompt at runtime (called from settings route).
+   */
+  static setSystemPrompt(prompt: string | undefined): void {
+    ClaudeOllamaProvider.customSystemPrompt = prompt;
   }
 
   /**
@@ -102,6 +112,18 @@ export class ClaudeOllamaProvider extends ClaudeProvider {
       log.debug({ error }, "Failed to fetch Ollama models");
       return [];
     }
+  }
+
+  /**
+   * Use a minimal system prompt that local models can actually follow.
+   * The full claude_code preset is far too complex for most Ollama models
+   * and causes them to get stuck in tool-calling loops.
+   */
+  protected override getSystemPrompt(globalInstructions?: string): string {
+    const base =
+      ClaudeOllamaProvider.customSystemPrompt ||
+      "You are a helpful coding assistant. You help users with software engineering tasks. You have access to tools for reading files, editing files, running shell commands, and searching code. Use tools when needed to answer questions or make changes. Be concise and direct.";
+    return globalInstructions ? `${base}\n\n${globalInstructions}` : base;
   }
 
   /**
