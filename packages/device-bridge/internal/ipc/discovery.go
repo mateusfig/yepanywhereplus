@@ -12,10 +12,12 @@ import (
 
 // DeviceInfo describes a discovered target device.
 type DeviceInfo struct {
-	ID    string `json:"id"`    // e.g., "emulator-5554", "R3CN90ABCDE", "chromeos:host"
-	AVD   string `json:"avd"`   // Display label (legacy name kept for client compatibility)
-	Type  string `json:"type"`  // "emulator" | "android" | "chromeos"
-	State string `json:"state"` // "running" or "stopped"
+	ID      string   `json:"id"`                // e.g., "emulator-5554", "R3CN90ABCDE", "chromeos:host"
+	Label   string   `json:"label"`             // Canonical display name
+	Type    string   `json:"type"`              // "emulator" | "android" | "chromeos"
+	State   string   `json:"state"`             // "running" | "stopped" | "connected" | ...
+	Actions []string `json:"actions,omitempty"` // Supported actions for this specific entry
+	AVD     string   `json:"avd,omitempty"`     // Legacy display label for older clients
 }
 
 // Discovery handles ADB-based device detection.
@@ -57,10 +59,12 @@ func (d *Discovery) ListDevices() ([]DeviceInfo, error) {
 	for _, avd := range avds {
 		if !runningAVDs[avd] {
 			result = append(result, DeviceInfo{
-				ID:    "avd-" + avd,
-				AVD:   avd,
-				Type:  "emulator",
-				State: "stopped",
+				ID:      "avd-" + avd,
+				Label:   avd,
+				Type:    "emulator",
+				State:   "stopped",
+				Actions: actionsForDevice("emulator", "stopped"),
+				AVD:     avd,
 			})
 		}
 	}
@@ -68,10 +72,12 @@ func (d *Discovery) ListDevices() ([]DeviceInfo, error) {
 	// Manual ChromeOS entry (only shown when configured).
 	if host := strings.TrimSpace(os.Getenv("CHROMEOS_HOST")); host != "" {
 		result = append(result, DeviceInfo{
-			ID:    "chromeos:" + host,
-			AVD:   "ChromeOS (" + host + ")",
-			Type:  "chromeos",
-			State: "running",
+			ID:      "chromeos:" + host,
+			Label:   "ChromeOS (" + host + ")",
+			Type:    "chromeos",
+			State:   "connected",
+			Actions: actionsForDevice("chromeos", "connected"),
+			AVD:     "ChromeOS (" + host + ")",
 		})
 	}
 
@@ -125,23 +131,45 @@ func parseADBDevicesOutput(output string, getAVDName func(serial string) string)
 		if strings.HasPrefix(serial, "emulator-") {
 			avdName := getAVDName(serial)
 			devices = append(devices, DeviceInfo{
-				ID:    serial,
-				AVD:   avdName,
-				Type:  "emulator",
-				State: "running",
+				ID:      serial,
+				Label:   avdName,
+				Type:    "emulator",
+				State:   "running",
+				Actions: actionsForDevice("emulator", "running"),
+				AVD:     avdName,
 			})
 			continue
 		}
 
 		devices = append(devices, DeviceInfo{
-			ID:    serial,
-			AVD:   serial,
-			Type:  "android",
-			State: "running",
+			ID:      serial,
+			Label:   serial,
+			Type:    "android",
+			State:   "running",
+			Actions: actionsForDevice("android", "running"),
+			AVD:     serial,
 		})
 	}
 
 	return devices
+}
+
+func actionsForDevice(deviceType, state string) []string {
+	switch deviceType {
+	case "emulator":
+		if state == "stopped" {
+			return []string{"start"}
+		}
+		return []string{"stream", "stop", "screenshot"}
+	case "android":
+		return []string{"stream"}
+	case "chromeos":
+		return []string{"stream"}
+	case "ios-simulator":
+		return []string{"stream"}
+	default:
+		return nil
+	}
 }
 
 // listAVDs queries `emulator -list-avds` for available AVD profiles.

@@ -71,6 +71,7 @@ export const SERVER_SCOPED_KEYS = {
   browserProfileId: "browser-profile-id",
   notifyInApp: "notify-in-app",
   recentProject: "recent-project",
+  chromeOsHosts: "chromeos-hosts",
 } as const;
 
 /** Build a server-scoped storage key */

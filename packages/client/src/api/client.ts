@@ -922,7 +922,29 @@ export const api = {
       body: JSON.stringify({ html, title }),
     }),
 
-  // Emulator API
+  // Device bridge API
+  getDevices: () => fetchJSON<DeviceInfo[]>("/devices"),
+
+  startDevice: (id: string) =>
+    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/start`, {
+      method: "POST",
+    }),
+
+  stopDevice: (id: string) =>
+    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/stop`, {
+      method: "POST",
+    }),
+
+  downloadDeviceBridge: () =>
+    fetchJSON<{
+      ok: boolean;
+      path?: string;
+      binaryPath?: string;
+      apkPath?: string;
+      error?: string;
+    }>("/devices/bridge/download", { method: "POST" }),
+
+  // Legacy aliases (kept while UI naming is still emulator-centric)
   getEmulators: () => fetchJSON<DeviceInfo[]>("/devices"),
 
   startEmulator: (id: string) =>

@@ -10,6 +10,7 @@ import type {
   DeviceSessionState,
   DeviceStreamStart,
   DeviceStreamStop,
+  DeviceType,
   DeviceWebRTCAnswer,
   DeviceWebRTCOffer,
   RTCIceCandidateInit,
@@ -194,7 +195,17 @@ export class DeviceBridgeService {
     );
   }
 
-  private needsAndroidServerAPK(deviceId: string): boolean {
+  private needsAndroidServerAPK(
+    deviceId: string,
+    deviceType?: DeviceType,
+  ): boolean {
+    if (deviceType) {
+      if (deviceType === "android") return true;
+      if (deviceType === "chromeos" || deviceType === "ios-simulator")
+        return false;
+      if (deviceType === "emulator") return this.shouldUseAPKForEmulators();
+    }
+
     const id = deviceId.trim();
     if (!id) {
       return false;
@@ -591,7 +602,7 @@ export class DeviceBridgeService {
 
   /** Start streaming a device to a client. */
   async startStream(msg: DeviceStreamStart, send: ClientSendFn): Promise<void> {
-    if (this.needsAndroidServerAPK(msg.deviceId)) {
+    if (this.needsAndroidServerAPK(msg.deviceId, msg.deviceType)) {
       await this.ensureAndroidServerAPK();
     }
     await this.ensureStarted();

@@ -72,6 +72,25 @@ type DeviceInfo struct {
 }
 ```
 
+Canonical client schema (shared `packages/shared/src/devices.ts`):
+
+```ts
+type DeviceType = "emulator" | "android" | "chromeos" | "ios-simulator";
+type DeviceState = "running" | "stopped" | "connected" | "disconnected" | "booted";
+
+interface DeviceInfo {
+  id: string;
+  label: string;
+  type: DeviceType;
+  state: DeviceState;
+  actions?: ("stream" | "screenshot" | "start" | "stop")[];
+  avd?: string; // legacy compatibility
+}
+```
+
+`device_stream_start` should include `deviceType` whenever the client has it,
+so the server does not rely on ID heuristics for runtime selection.
+
 ### Frame capture model: pull for all device types
 
 The emulator uses pull (sidecar polls gRPC). Physical Android and ChromeOS also use pull — neither has a public "frame ready" notification without root. The `FrameSource` polling loop works unchanged for all device types. `Device.GetFrame()` is the only addition.
@@ -350,6 +369,14 @@ Expected output when prerequisites are missing (e.g. in CI):
 ### Known environment requirement
 
 The test server must run over plain HTTP. If `HTTPS_SELF_SIGNED=true` is set in your shell, `global-setup.ts` explicitly clears it for the test server — you do not need to unset it manually.
+
+---
+
+## Android Agent Control (Accessibility Tree + CLI)
+
+See **[device-bridge-android-a11y.md](device-bridge-android-a11y.md)** for the full design.
+
+Extends `DeviceServer.java` with `UiAutomation` accessibility tree support so AI agents can understand and interact with Android screens without screenshots. A standalone CLI (`bin/android-agent`) talks directly to the APK over ADB forwarding — independent of the streaming bridge. Modeled after the [chromeos-testbed](~/code/chromeos-testbed) pattern: `snapshot` → `find` → `tap`/`type` → `snapshot` workflow, with compact LLM-friendly output and a skill definition for agent integration.
 
 ---
 

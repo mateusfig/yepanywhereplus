@@ -283,7 +283,10 @@ export { parseOpenCodeSSEEvent } from "./opencode-schema/events.js";
 
 // Device bridge streaming types (for device bridge remote control)
 export type {
+  DeviceAction,
   DeviceInfo,
+  DeviceState,
+  DeviceType,
   DeviceStreamStart,
   DeviceStreamStop,
   DeviceWebRTCAnswer,

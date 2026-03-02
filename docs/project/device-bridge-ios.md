@@ -217,6 +217,10 @@ type DeviceInfo struct {
 }
 ```
 
+Client signaling should pass `deviceType: "ios-simulator"` in
+`device_stream_start` so server runtime selection never depends on parsing a
+UDID-like `deviceId`.
+
 ### Binary resolution
 
 Priority order (same pattern as Android APK):

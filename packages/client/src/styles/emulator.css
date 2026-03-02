@@ -6,7 +6,22 @@
 .emulator-list {
   display: flex;
   flex-direction: column;
+  gap: 12px;
+}
+
+.emulator-list-group {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
+}
+
+.emulator-list-group-title {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--app-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
 
 .emulator-list-item {

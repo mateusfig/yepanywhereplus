@@ -1,5 +1,5 @@
 import type { DeviceInfo } from "@yep-anywhere/shared";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { EmulatorNavButtons } from "../components/EmulatorNavButtons";
 import { EmulatorStream } from "../components/EmulatorStream";
@@ -10,65 +10,166 @@ import { useEmulators } from "../hooks/useEmulators";
 import { useVersion } from "../hooks/useVersion";
 import { useNavigationLayout } from "../layouts";
 
+const DEVICE_TYPE_ORDER: DeviceInfo["type"][] = [
+  "emulator",
+  "android",
+  "chromeos",
+  "ios-simulator",
+];
+
+function deviceLabel(device: DeviceInfo): string {
+  return device.label || device.avd || device.id;
+}
+
+function deviceTypeLabel(type: DeviceInfo["type"]): string {
+  switch (type) {
+    case "emulator":
+      return "Android Emulators";
+    case "android":
+      return "Android Devices";
+    case "chromeos":
+      return "ChromeOS Devices";
+    case "ios-simulator":
+      return "iOS Simulators";
+    default:
+      return "Devices";
+  }
+}
+
+function hasAction(device: DeviceInfo, action: "stream" | "start" | "stop") {
+  if (device.actions?.length) {
+    return device.actions.includes(action);
+  }
+
+  if (action === "stream") {
+    return device.state !== "stopped";
+  }
+  if (action === "start") {
+    return device.type === "emulator" && device.state === "stopped";
+  }
+  if (action === "stop") {
+    return device.type === "emulator" && device.state !== "stopped";
+  }
+  return false;
+}
+
 function EmulatorListItem({
-  emulator,
+  device,
   onConnect,
   onStart,
   onStop,
 }: {
-  emulator: DeviceInfo;
-  onConnect: (id: string) => void;
+  device: DeviceInfo;
+  onConnect: (device: DeviceInfo) => void;
   onStart: (id: string) => void;
   onStop: (id: string) => void;
 }) {
-  const isRunning = emulator.state === "running";
+  const canConnect = hasAction(device, "stream");
+  const canStart = hasAction(device, "start");
+  const canStop = hasAction(device, "stop");
 
   return (
     <div className="emulator-list-item">
       <div className="emulator-list-item-info">
-        <span className="emulator-list-item-name">{emulator.avd}</span>
+        <span className="emulator-list-item-name">{deviceLabel(device)}</span>
         <span
-          className={`emulator-list-item-status ${isRunning ? "running" : "stopped"}`}
+          className={`emulator-list-item-status ${device.state === "stopped" ? "stopped" : "running"}`}
         >
-          {emulator.state}
+          {device.state}
         </span>
       </div>
       <div className="emulator-list-item-actions">
-        {isRunning ? (
-          <>
-            <button
-              type="button"
-              className="emulator-btn emulator-btn-primary"
-              onClick={() => onConnect(emulator.id)}
-            >
-              Connect
-            </button>
-            <button
-              type="button"
-              className="emulator-btn emulator-btn-secondary"
-              onClick={() => onStop(emulator.id)}
-            >
-              Stop
-            </button>
-          </>
-        ) : (
+        {canConnect && (
+          <button
+            type="button"
+            className="emulator-btn emulator-btn-primary"
+            onClick={() => onConnect(device)}
+          >
+            Connect
+          </button>
+        )}
+        {canStop && (
           <button
             type="button"
             className="emulator-btn emulator-btn-secondary"
-            onClick={() => onStart(emulator.id)}
+            onClick={() => onStop(device.id)}
+          >
+            Stop
+          </button>
+        )}
+        {!canStop && canStart && (
+          <button
+            type="button"
+            className="emulator-btn emulator-btn-secondary"
+            onClick={() => onStart(device.id)}
           >
             Start
           </button>
+        )}
+        {!canConnect && !canStop && !canStart && (
+          <span className="emulator-list-item-status">No actions</span>
         )}
       </div>
     </div>
   );
 }
 
+function DeviceList({
+  devices,
+  onConnect,
+  onStart,
+  onStop,
+}: {
+  devices: DeviceInfo[];
+  onConnect: (device: DeviceInfo) => void;
+  onStart: (id: string) => void;
+  onStop: (id: string) => void;
+}) {
+  const grouped = useMemo(() => {
+    const groups = new Map<DeviceInfo["type"], DeviceInfo[]>();
+    for (const type of DEVICE_TYPE_ORDER) {
+      groups.set(type, []);
+    }
+    for (const device of devices) {
+      const bucket = groups.get(device.type);
+      if (bucket) {
+        bucket.push(device);
+      } else {
+        groups.set(device.type, [device]);
+      }
+    }
+    return groups;
+  }, [devices]);
+
+  return (
+    <div className="emulator-list">
+      {Array.from(grouped.entries()).map(([type, entries]) => {
+        if (entries.length === 0) return null;
+        return (
+          <section key={type} className="emulator-list-group">
+            <h3 className="emulator-list-group-title">
+              {deviceTypeLabel(type)}
+            </h3>
+            {entries.map((device) => (
+              <EmulatorListItem
+                key={device.id}
+                device={device}
+                onConnect={onConnect}
+                onStart={onStart}
+                onStop={onStop}
+              />
+            ))}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
 function StreamView({
-  deviceId,
+  device,
   onBack,
-}: { deviceId: string; onBack: () => void }) {
+}: { device: DeviceInfo; onBack: () => void }) {
   const {
     remoteStream,
     dataChannel,
@@ -82,9 +183,9 @@ function StreamView({
 
   // Auto-connect when entering stream view
   useEffect(() => {
-    connect(deviceId);
+    connect({ id: device.id, type: device.type });
     return () => disconnect();
-  }, [deviceId, connect, disconnect]);
+  }, [device.id, device.type, connect, disconnect]);
 
   const handleBack = () => {
     disconnect();
@@ -101,7 +202,9 @@ function StreamView({
         >
           Back
         </button>
-        <span className="emulator-connection-state">{connectionState}</span>
+        <span className="emulator-connection-state">
+          {deviceLabel(device)} - {connectionState}
+        </span>
       </div>
 
       {error && <div className="emulator-error">{error}</div>}
@@ -133,7 +236,7 @@ function DownloadPrompt({ onDownloaded }: { onDownloaded: () => void }) {
     setDownloading(true);
     setError(null);
     try {
-      const result = await api.downloadEmulatorBridge();
+      const result = await api.downloadDeviceBridge();
       if (result.ok) {
         onDownloaded();
       } else {
@@ -176,24 +279,24 @@ export function EmulatorPage() {
 
   const { emulators, loading, error, startEmulator, stopEmulator } =
     useEmulators({ enabled: !needsDownload });
-  const [activeEmulatorId, setActiveEmulatorId] = useState<string | null>(null);
+  const [activeDevice, setActiveDevice] = useState<DeviceInfo | null>(null);
 
-  // ?auto — auto-connect to the first running emulator
+  // ?auto — auto-connect to the first streamable running device.
   useEffect(() => {
-    if (activeEmulatorId || loading || needsDownload) return;
+    if (activeDevice || loading || needsDownload) return;
     const params = new URLSearchParams(window.location.search);
     if (!params.has("auto")) return;
-    const running = emulators.find((e) => e.state === "running");
-    if (running) setActiveEmulatorId(running.id);
-  }, [emulators, loading, activeEmulatorId, needsDownload]);
+    const streamable = emulators.find((d) => hasAction(d, "stream"));
+    if (streamable) setActiveDevice(streamable);
+  }, [emulators, loading, activeDevice, needsDownload]);
 
-  if (activeEmulatorId) {
+  if (activeDevice) {
     return (
       <div className="main-content-wrapper">
         <div className="main-content-constrained">
           <StreamView
-            deviceId={activeEmulatorId}
-            onBack={() => setActiveEmulatorId(null)}
+            device={activeDevice}
+            onBack={() => setActiveDevice(null)}
           />
         </div>
       </div>
@@ -204,7 +307,7 @@ export function EmulatorPage() {
     <div className="main-content-wrapper">
       <div className="main-content-constrained">
         <PageHeader
-          title="Emulator"
+          title="Devices"
           onOpenSidebar={openSidebar}
           onToggleSidebar={toggleSidebar}
           isWideScreen={isWideScreen}
@@ -220,22 +323,17 @@ export function EmulatorPage() {
                 {error && <div className="emulator-error">{error}</div>}
                 {!loading && emulators.length === 0 && (
                   <div className="emulator-empty">
-                    No emulators detected. Make sure ADB is running and
-                    emulators are available.
+                    No devices detected. Connect an Android emulator/device or
+                    add a ChromeOS SSH host alias in Settings.
                   </div>
                 )}
                 {emulators.length > 0 && (
-                  <div className="emulator-list">
-                    {emulators.map((emu) => (
-                      <EmulatorListItem
-                        key={emu.id}
-                        emulator={emu}
-                        onConnect={setActiveEmulatorId}
-                        onStart={startEmulator}
-                        onStop={stopEmulator}
-                      />
-                    ))}
-                  </div>
+                  <DeviceList
+                    devices={emulators}
+                    onConnect={setActiveDevice}
+                    onStart={startEmulator}
+                    onStop={stopEmulator}
+                  />
                 )}
               </>
             )}

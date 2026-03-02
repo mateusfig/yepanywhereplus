@@ -6,18 +6,41 @@
  * - Client: device tab UI, WebRTC signaling (Phase 3)
  */
 
+/** Canonical device classes supported by the bridge. */
+export type DeviceType = "emulator" | "android" | "chromeos" | "ios-simulator";
+
+/** Canonical device states surfaced to the client. */
+export type DeviceState =
+  | "running"
+  | "stopped"
+  | "connected"
+  | "disconnected"
+  | "booted";
+
+/** High-level actions currently supported by a device entry. */
+export type DeviceAction = "stream" | "screenshot" | "start" | "stop";
+
 // ============================================================================
 // Device Discovery
 // ============================================================================
 
-/** Info about a discovered Android emulator (from ADB + AVD detection). */
+/** Canonical info about a discovered bridge device. */
 export interface DeviceInfo {
-  /** Emulator identifier, e.g., "emulator-5554" (running) or "avd-Pixel_7" (stopped) */
+  /** Stable device identifier used for start/stop/stream operations. */
   id: string;
-  /** AVD profile name, e.g., "Pixel_7" */
-  avd: string;
-  /** Whether the emulator is currently running */
-  state: "running" | "stopped";
+  /** Human-friendly name for display in the UI. */
+  label: string;
+  /** Device class used for routing and UI grouping. */
+  type: DeviceType;
+  /** Current runtime status. */
+  state: DeviceState;
+  /** Supported actions for this specific device instance/state. */
+  actions?: DeviceAction[];
+  /**
+   * Legacy field kept for compatibility with older clients.
+   * Prefer `label` for all new UI.
+   */
+  avd?: string;
 }
 
 // ============================================================================
@@ -29,8 +52,13 @@ export interface DeviceStreamStart {
   type: "device_stream_start";
   /** Client-generated UUID for this streaming session */
   sessionId: string;
-  /** Which emulator to stream (DeviceInfo.id) */
+  /** Which device to stream (DeviceInfo.id) */
   deviceId: string;
+  /**
+   * Optional explicit device type. Used to avoid server-side ID heuristics
+   * when deciding transport/runtime dependencies.
+   */
+  deviceType?: DeviceType;
   /** Optional streaming parameters */
   options?: { maxFps?: number; maxWidth?: number; quality?: number };
 }

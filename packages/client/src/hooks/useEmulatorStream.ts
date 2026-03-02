@@ -1,4 +1,4 @@
-import type { DeviceServerMessage } from "@yep-anywhere/shared";
+import type { DeviceServerMessage, DeviceType } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getGlobalConnection } from "../lib/connection";
 import { getWebSocketConnection } from "../lib/connection/WebSocketConnection";
@@ -25,8 +25,8 @@ interface UseEmulatorStreamResult {
   connectionState: EmulatorConnectionState;
   /** Error message if connection failed */
   error: string | null;
-  /** Start streaming from the specified emulator */
-  connect: (deviceId: string) => void;
+  /** Start streaming from the specified device */
+  connect: (device: { id: string; type?: DeviceType }) => void;
   /** Stop streaming */
   disconnect: () => void;
 }
@@ -102,7 +102,7 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
   }, [getConnection]);
 
   const connect = useCallback(
-    (deviceId: string) => {
+    (device: { id: string; type?: DeviceType }) => {
       // Clean up any existing connection
       disconnect();
 
@@ -110,7 +110,7 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
       sessionIdRef.current = sessionId;
       const sid = sessionId.slice(0, 8);
       console.log(
-        `${LOG_PREFIX} connect(deviceId=${deviceId}, session=${sid})`,
+        `${LOG_PREFIX} connect(deviceId=${device.id}, type=${device.type ?? "unknown"}, session=${sid})`,
       );
       setConnectionState("connecting");
       setError(null);
@@ -320,7 +320,8 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
         conn.sendMessage?.({
           type: "device_stream_start",
           sessionId,
-          deviceId,
+          deviceId: device.id,
+          deviceType: device.type,
           options: { maxFps, maxWidth, quality: crf },
         });
       };

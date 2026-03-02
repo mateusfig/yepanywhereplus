@@ -1,6 +1,10 @@
-import type { DeviceInfo } from "@yep-anywhere/shared";
+import type { DeviceAction, DeviceInfo } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
+import {
+  listChromeOSHosts,
+  mergeConfiguredChromeOSHosts,
+} from "../lib/chromeOsHosts";
 
 interface UseEmulatorsResult {
   emulators: DeviceInfo[];
@@ -20,6 +24,39 @@ interface UseEmulatorsOptions {
 
 /** Max backoff interval when errors occur (30s). */
 const MAX_BACKOFF_MS = 30_000;
+
+function inferType(id: string): DeviceInfo["type"] {
+  if (id.startsWith("chromeos:") || id === "chromeos") return "chromeos";
+  if (id.startsWith("emulator-") || id.startsWith("avd-")) return "emulator";
+  if (id.startsWith("ios-sim:")) return "ios-simulator";
+  return "android";
+}
+
+function inferActions(
+  type: DeviceInfo["type"],
+  state: DeviceInfo["state"],
+): DeviceAction[] {
+  if (type === "emulator") {
+    if (state === "stopped") return ["start"];
+    return ["stream", "stop", "screenshot"];
+  }
+  return ["stream"];
+}
+
+function normalizeDeviceInfo(device: DeviceInfo): DeviceInfo {
+  const type = device.type ?? inferType(device.id);
+  const state = device.state ?? "running";
+  return {
+    ...device,
+    label: device.label || device.avd || device.id,
+    type,
+    state,
+    actions:
+      device.actions && device.actions.length > 0
+        ? device.actions
+        : inferActions(type, state),
+  };
+}
 
 /**
  * Hook to fetch and manage emulator list.
@@ -45,9 +82,12 @@ export function useEmulators(
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     try {
-      const result = await api.getEmulators();
+      const result = await api.getDevices();
       if (mountedRef.current) {
-        setEmulators(result);
+        const normalized = result.map(normalizeDeviceInfo);
+        setEmulators(
+          mergeConfiguredChromeOSHosts(normalized, listChromeOSHosts()),
+        );
         setError(null);
         consecutiveErrorsRef.current = 0;
       }
@@ -67,7 +107,7 @@ export function useEmulators(
   const startEmulator = useCallback(
     async (id: string) => {
       try {
-        await api.startEmulator(id);
+        await api.startDevice(id);
         await refresh();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -79,7 +119,7 @@ export function useEmulators(
   const stopEmulator = useCallback(
     async (id: string) => {
       try {
-        await api.stopEmulator(id);
+        await api.stopDevice(id);
         await refresh();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
