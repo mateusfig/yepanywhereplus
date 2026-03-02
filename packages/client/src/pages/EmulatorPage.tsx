@@ -71,6 +71,7 @@ function StreamView({
   const {
     remoteStream,
     dataChannel,
+    peerConnection,
     connectionState,
     error,
     connect,
@@ -108,7 +109,7 @@ function StreamView({
       )}
 
       <div className="emulator-stream-container">
-        <EmulatorStream stream={remoteStream} dataChannel={dataChannel} />
+        <EmulatorStream stream={remoteStream} dataChannel={dataChannel} peerConnection={peerConnection} />
       </div>
 
       <EmulatorNavButtons dataChannel={dataChannel} />

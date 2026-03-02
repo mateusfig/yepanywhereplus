@@ -21,13 +21,15 @@ func NewH264Encoder(width, height, fps int) (*H264Encoder, error) {
 	buf := &bytes.Buffer{}
 
 	opts := &x264.Options{
-		Width:     width,
-		Height:    height,
-		FrameRate: fps,
-		Preset:    "ultrafast",
-		Tune:      "zerolatency",
-		Profile:   "baseline",
-		LogLevel:  x264.LogWarning,
+		Width:        width,
+		Height:       height,
+		FrameRate:    fps,
+		Preset:       "ultrafast",
+		Tune:         "zerolatency",
+		Profile:      "baseline",
+		RateControl:  "crf",
+		RateConstant: 30, // ~2-5 Mbps at 720p; without this, ultrafast produces ~30 Mbps
+		LogLevel:     x264.LogWarning,
 	}
 
 	enc, err := x264.NewEncoder(buf, opts)

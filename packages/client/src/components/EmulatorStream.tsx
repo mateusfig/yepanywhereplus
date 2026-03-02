@@ -5,6 +5,8 @@ interface EmulatorStreamProps {
   stream: MediaStream | null;
   /** WebRTC DataChannel for sending touch/key events */
   dataChannel: RTCDataChannel | null;
+  /** RTCPeerConnection for diagnostics */
+  peerConnection: RTCPeerConnection | null;
 }
 
 /**
@@ -40,7 +42,7 @@ function clamp01(v: number): number {
  * Video element for emulator stream with touch and mouse event capture.
  * Coordinates are normalized to 0.0-1.0, accounting for object-fit letterboxing.
  */
-export function EmulatorStream({ stream, dataChannel }: EmulatorStreamProps) {
+export function EmulatorStream({ stream, dataChannel, peerConnection }: EmulatorStreamProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   // Attach stream to video element and monitor health
@@ -64,19 +66,46 @@ export function EmulatorStream({ stream, dataChannel }: EmulatorStreamProps) {
     // Monitor video playback health — detect stale frames
     let lastTime = -1;
     let staleCount = 0;
-    const healthCheck = setInterval(() => {
+    let lastPacketsReceived = 0;
+    let lastBytesReceived = 0;
+    const healthCheck = setInterval(async () => {
       const ct = video.currentTime;
       if (lastTime >= 0 && ct === lastTime && !video.paused) {
         staleCount++;
+
+        // Query WebRTC stats to see if RTP packets are still arriving
+        let statsInfo = "";
+        if (peerConnection && peerConnection.connectionState !== "closed") {
+          try {
+            const stats = await peerConnection.getStats();
+            stats.forEach((report) => {
+              if (report.type === "inbound-rtp" && report.kind === "video") {
+                const pkts = report.packetsReceived ?? 0;
+                const bytes = report.bytesReceived ?? 0;
+                const lost = report.packetsLost ?? 0;
+                const pktsDelta = pkts - lastPacketsReceived;
+                const bytesDelta = bytes - lastBytesReceived;
+                lastPacketsReceived = pkts;
+                lastBytesReceived = bytes;
+                statsInfo = ` rtp: +${pktsDelta}pkts/+${bytesDelta}bytes (total=${pkts}, lost=${lost})`;
+              }
+            });
+          } catch { /* pc may be closing */ }
+        }
+
         if (staleCount === 1) {
           console.warn(
-            `[EmulatorStream] video stale: currentTime=${ct.toFixed(3)} not advancing`,
+            `[EmulatorStream] video stale: currentTime=${ct.toFixed(3)} not advancing${statsInfo}`,
           );
         } else if (staleCount % 6 === 0) {
           // Log every 30s (6 × 5s intervals)
           const track = stream.getVideoTracks()[0];
           console.warn(
-            `[EmulatorStream] video still stale (${staleCount * 5}s): currentTime=${ct.toFixed(3)}, track=${track?.readyState ?? "none"}, streamActive=${stream.active}`,
+            `[EmulatorStream] video still stale (${staleCount * 5}s): currentTime=${ct.toFixed(3)}, track=${track?.readyState ?? "none"}, streamActive=${stream.active}${statsInfo}`,
+          );
+        } else {
+          console.warn(
+            `[EmulatorStream] video stale (${staleCount * 5}s)${statsInfo}`,
           );
         }
       } else {
@@ -86,6 +115,18 @@ export function EmulatorStream({ stream, dataChannel }: EmulatorStreamProps) {
           );
         }
         staleCount = 0;
+        // Track baseline RTP stats when healthy
+        if (peerConnection && peerConnection.connectionState !== "closed") {
+          try {
+            const stats = await peerConnection.getStats();
+            stats.forEach((report) => {
+              if (report.type === "inbound-rtp" && report.kind === "video") {
+                lastPacketsReceived = report.packetsReceived ?? 0;
+                lastBytesReceived = report.bytesReceived ?? 0;
+              }
+            });
+          } catch { /* ignore */ }
+        }
       }
       lastTime = ct;
     }, 5000);

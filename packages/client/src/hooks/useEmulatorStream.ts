@@ -18,6 +18,8 @@ interface UseEmulatorStreamResult {
   remoteStream: MediaStream | null;
   /** WebRTC DataChannel for touch/key input */
   dataChannel: RTCDataChannel | null;
+  /** RTCPeerConnection for diagnostics (getStats) */
+  peerConnection: RTCPeerConnection | null;
   /** Current connection state */
   connectionState: EmulatorConnectionState;
   /** Error message if connection failed */
@@ -369,6 +371,7 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
   return {
     remoteStream,
     dataChannel,
+    peerConnection: pcRef.current,
     connectionState,
     error,
     connect,

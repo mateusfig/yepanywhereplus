@@ -220,6 +220,16 @@ func (ps *PeerSession) WriteVideoSample(data []byte, duration time.Duration) err
 	})
 }
 
+// ConnectionState returns the current PeerConnection state.
+func (ps *PeerSession) ConnectionState() string {
+	return ps.pc.ConnectionState().String()
+}
+
+// ICEConnectionState returns the current ICE connection state.
+func (ps *PeerSession) ICEConnectionState() string {
+	return ps.pc.ICEConnectionState().String()
+}
+
 // Close tears down the PeerConnection.
 func (ps *PeerSession) Close() error {
 	log.Printf("[peer %s] Close() called (iceState=%s, connState=%s)",

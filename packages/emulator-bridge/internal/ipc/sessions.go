@@ -24,6 +24,7 @@ type streamSession struct {
 	sessionID   string
 	emulatorID  string
 	maxWidth    int // for pool release key
+	maxFPS      int
 	frameSource *emulator.FrameSource // shared via pool, not owned
 	enc         *encoder.H264Encoder
 	peer        *stream.PeerSession
@@ -162,6 +163,7 @@ func (sm *SessionManager) StartSession(sessionID, emulatorID string, opts Sessio
 		sessionID:   sessionID,
 		emulatorID:  emulatorID,
 		maxWidth:    maxWidth,
+		maxFPS:      maxFPS,
 		frameSource: frameSource,
 		enc:         h264Enc,
 		peer:        peer,
@@ -317,18 +319,67 @@ func (sm *SessionManager) runPipeline(sess *streamSession) {
 	activityTimer := time.NewTimer(activityTimeout)
 	defer activityTimer.Stop()
 
-	var lastTime time.Time
+	// Pipeline stats for diagnostics.
+	var (
+		lastTime       time.Time
+		framesReceived uint64
+		framesDrained  uint64
+		framesEncoded  uint64
+		framesWritten  uint64
+		encodeErrors   uint64
+		nilNals        uint64
+		totalWriteBytes uint64
+		statsStart     = time.Now()
+	)
+
+	// Rate-limit encoding to maxFPS. Without this, the polling loop feeds
+	// frames as fast as gRPC delivers (~185 fps), producing excessive bitrate.
+	frameInterval := time.Second / time.Duration(sess.maxFPS)
+	rateLimiter := time.NewTicker(frameInterval)
+	defer rateLimiter.Stop()
+
+	const statsInterval = 5 * time.Second
+	statsTicker := time.NewTicker(statsInterval)
+	defer statsTicker.Stop()
+
+	logStats := func(reason string) {
+		elapsed := time.Since(statsStart).Seconds()
+		fps := float64(0)
+		if elapsed > 0 {
+			fps = float64(framesWritten) / elapsed
+		}
+		log.Printf("[session %s] stats (%s): recv=%d drained=%d encoded=%d written=%d nilNals=%d encErr=%d writeBytes=%d fps=%.1f elapsed=%.1fs conn=%s ice=%s",
+			sess.sessionID, reason,
+			framesReceived, framesDrained, framesEncoded, framesWritten, nilNals, encodeErrors,
+			totalWriteBytes, fps, elapsed,
+			sess.peer.ConnectionState(), sess.peer.ICEConnectionState())
+	}
 
 	for {
 		select {
 		case <-sess.peer.Done():
+			logStats("peer-done")
 			return
 		case <-activityTimer.C:
+			logStats("activity-timeout")
 			log.Printf("[session %s] activity timeout (%v with no frames written), closing", sess.sessionID, activityTimeout)
 			go sm.StopSession(sess.sessionID)
 			return
-		case frame, ok := <-frames:
-			if !ok {
+		case <-statsTicker.C:
+			logStats("periodic")
+		case <-rateLimiter.C:
+			// Wait for a frame (or drain stale ones).
+			var frame *emulator.Frame
+			select {
+			case f, ok := <-frames:
+				if !ok {
+					logStats("frames-closed")
+					return
+				}
+				frame = f
+				framesReceived++
+			case <-sess.peer.Done():
+				logStats("peer-done")
 				return
 			}
 
@@ -337,8 +388,10 @@ func (sm *SessionManager) runPipeline(sess *streamSession) {
 				select {
 				case newer, ok2 := <-frames:
 					if !ok2 {
+						logStats("frames-closed")
 						return
 					}
+					framesDrained++
 					frame = newer
 				default:
 					goto encode
@@ -355,12 +408,15 @@ func (sm *SessionManager) runPipeline(sess *streamSession) {
 			nals, err := sess.enc.Encode(y, cb, cr)
 			encoder.ReleaseI420(y) // return pooled buffer
 			if err != nil {
+				encodeErrors++
 				log.Printf("[session %s] encode error: %v", sess.sessionID, err)
 				continue
 			}
 			if nals == nil {
+				nilNals++
 				continue
 			}
+			framesEncoded++
 
 			now := time.Now()
 			duration := time.Second / 30
@@ -370,9 +426,12 @@ func (sm *SessionManager) runPipeline(sess *streamSession) {
 			lastTime = now
 
 			if err := sess.peer.WriteVideoSample(nals, duration); err != nil {
+				logStats("write-error")
 				log.Printf("[session %s] write error: %v", sess.sessionID, err)
 				return
 			}
+			framesWritten++
+			totalWriteBytes += uint64(len(nals))
 
 			// Reset activity timer on successful write.
 			if !activityTimer.Stop() {
