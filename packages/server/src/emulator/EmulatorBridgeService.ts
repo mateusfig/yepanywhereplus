@@ -124,6 +124,8 @@ export class EmulatorBridgeService {
     const binaryPath = this.findBinaryPath();
     if (!binaryPath) return;
 
+    const currentPid = this.process?.pid;
+
     try {
       // Find all processes matching the bridge binary path
       const result = execSync(`pgrep -f "${binaryPath}" 2>/dev/null`, {
@@ -132,10 +134,14 @@ export class EmulatorBridgeService {
       }).trim();
 
       if (result) {
-        const pids = result.split("\n").filter(Boolean);
+        const pids = result
+          .split("\n")
+          .filter(Boolean)
+          .map(Number)
+          .filter((pid) => pid !== currentPid);
         for (const pid of pids) {
           try {
-            process.kill(Number(pid), "SIGTERM");
+            process.kill(pid, "SIGTERM");
             console.log(`[EmulatorBridge] Killed stale bridge process ${pid}`);
           } catch {
             // Process might have already exited.
@@ -151,6 +157,12 @@ export class EmulatorBridgeService {
   private async start(): Promise<void> {
     if (this.starting) return;
     this.starting = true;
+
+    // Cancel any pending restart timer to prevent cascading restarts.
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
 
     try {
       const binaryPath = this.findBinaryPath();
@@ -187,14 +199,16 @@ export class EmulatorBridgeService {
         }
       });
 
-      // Monitor exit.
+      // Monitor exit — ignore stale events from previously-killed processes.
       child.on("exit", (code, signal) => {
+        if (this.process !== child) return;
         console.warn(
           `[EmulatorBridge] Sidecar exited (code=${code}, signal=${signal})`,
         );
         this.cleanup();
-        // Don't auto-restart on clean exit (idle shutdown) — will restart on next demand.
-        if (code !== 0) {
+        // Don't auto-restart on clean exit (idle shutdown, code=0)
+        // or intentional kill (code=null, signal=SIGTERM).
+        if (code != null && code !== 0) {
           this.scheduleRestart();
         }
       });
