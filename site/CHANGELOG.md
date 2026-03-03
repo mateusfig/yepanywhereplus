@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [site-v1.5.19] - 2026-03-03
+
+### Added
+- Per-article Open Graph image support in ArticleLayout
+- Custom OG image for remote device control blog post
+
 ## [site-v1.5.18] - 2026-03-03
 
 ### Added
