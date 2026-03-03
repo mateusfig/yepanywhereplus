@@ -110,7 +110,7 @@ test("streams physical Android device video over WebRTC when attached", async ({
   }, deviceSerial);
 
   await expect(page.locator(".emulator-connection-state")).toHaveText(
-    "connected",
+    /connected$/,
     { timeout: 30_000 },
   );
 

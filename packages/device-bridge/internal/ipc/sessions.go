@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,8 @@ type streamSession struct {
 	maxWidth    int // for pool release key
 	maxFPS      int
 	frameSource *device.FrameSource // shared via pool, not owned
+	nalSource   *device.NalSource
+	streamCap   device.StreamCapable
 	enc         *encoder.H264Encoder
 	peer        *stream.PeerSession
 	input       *stream.InputHandler
@@ -126,15 +129,43 @@ func (sm *SessionManager) StartSession(sessionID, deviceID, deviceType string, o
 	targetW, targetH := encoder.ComputeTargetSize(int(srcW), int(srcH), maxWidth)
 	log.Printf("[session %s] screen %dx%d → encoding %dx%d", sessionID, srcW, srcH, targetW, targetH)
 
-	h264Enc, err := encoder.NewH264Encoder(targetW, targetH, maxFPS, opts.Quality)
-	if err != nil {
-		sm.pool.ReleaseDevice(deviceID)
-		sm.sendState(sessionID, "failed", fmt.Sprintf("encoder: %v", err))
-		return fmt.Errorf("creating encoder: %w", err)
+	var (
+		frameSource *device.FrameSource
+		nalSource   *device.NalSource
+		streamCap   device.StreamCapable
+		h264Enc     *encoder.H264Encoder
+	)
+
+	// Try Android hardware stream path first; fall back to JPEG+x264 on any failure.
+	if strings.EqualFold(deviceType, "android") {
+		if sc, ok := client.(device.StreamCapable); ok {
+			streamOpts := device.StreamOptions{
+				Width:      targetW,
+				Height:     targetH,
+				FPS:        maxFPS,
+				BitrateBps: estimateAndroidBitrate(targetW, targetH, maxFPS),
+			}
+			if ns, streamErr := sc.StartStream(context.Background(), streamOpts); streamErr == nil {
+				nalSource = ns
+				streamCap = sc
+				log.Printf("[session %s] using on-device MediaCodec stream (%dx%d @ %dfps)", sessionID, targetW, targetH, maxFPS)
+			} else {
+				log.Printf("[session %s] stream_start unavailable, falling back to screenshot path: %v", sessionID, streamErr)
+			}
+		}
 	}
 
-	// Acquire shared FrameSource from pool.
-	frameSource := sm.pool.AcquireFrameSource(deviceID, maxWidth, maxFPS, client)
+	if nalSource == nil {
+		h264Enc, err = encoder.NewH264Encoder(targetW, targetH, maxFPS, opts.Quality)
+		if err != nil {
+			sm.pool.ReleaseDevice(deviceID)
+			sm.sendState(sessionID, "failed", fmt.Sprintf("encoder: %v", err))
+			return fmt.Errorf("creating encoder: %w", err)
+		}
+		// Acquire shared FrameSource from pool only on screenshot mode.
+		frameSource = sm.pool.AcquireFrameSource(deviceID, maxWidth, maxFPS, client)
+	}
+
 	inputHandler := stream.NewInputHandler(client)
 
 	fpsCh := make(chan int, 1)
@@ -165,8 +196,15 @@ func (sm *SessionManager) StartSession(sessionID, deviceID, deviceType string, o
 	}
 	peer, err := stream.NewPeerSession(sessionID, sm.stunServers, onMessage, onICE)
 	if err != nil {
-		sm.pool.ReleaseFrameSource(deviceID, maxWidth)
-		h264Enc.Close()
+		if frameSource != nil {
+			sm.pool.ReleaseFrameSource(deviceID, maxWidth)
+		}
+		if h264Enc != nil {
+			h264Enc.Close()
+		}
+		if streamCap != nil {
+			_ = streamCap.StopStream(context.Background())
+		}
 		sm.pool.ReleaseDevice(deviceID)
 		sm.sendState(sessionID, "failed", fmt.Sprintf("peer: %v", err))
 		return fmt.Errorf("creating peer: %w", err)
@@ -175,8 +213,15 @@ func (sm *SessionManager) StartSession(sessionID, deviceID, deviceType string, o
 	sdp, err := peer.CreateOffer()
 	if err != nil {
 		peer.Close()
-		sm.pool.ReleaseFrameSource(deviceID, maxWidth)
-		h264Enc.Close()
+		if frameSource != nil {
+			sm.pool.ReleaseFrameSource(deviceID, maxWidth)
+		}
+		if h264Enc != nil {
+			h264Enc.Close()
+		}
+		if streamCap != nil {
+			_ = streamCap.StopStream(context.Background())
+		}
 		sm.pool.ReleaseDevice(deviceID)
 		sm.sendState(sessionID, "failed", fmt.Sprintf("offer: %v", err))
 		return fmt.Errorf("creating offer: %w", err)
@@ -189,6 +234,8 @@ func (sm *SessionManager) StartSession(sessionID, deviceID, deviceType string, o
 		maxWidth:    maxWidth,
 		maxFPS:      maxFPS,
 		frameSource: frameSource,
+		nalSource:   nalSource,
+		streamCap:   streamCap,
 		enc:         h264Enc,
 		peer:        peer,
 		input:       inputHandler,
@@ -300,13 +347,21 @@ func (sm *SessionManager) CloseAll() {
 func (sm *SessionManager) closeSessionLocked(sess *streamSession) {
 	sess.cancel()
 	sess.peer.Close()
-	// Wait for the pipeline goroutine to exit before freeing the encoder.
-	// The x264 C library will crash (SIGSEGV/SIGABRT) if the encoder is freed
-	// while a concurrent encode call is in progress.
+	// Wait for the pipeline goroutine to exit before freeing resources.
 	sess.pipelineWg.Wait()
-	sess.enc.Close()
+
+	if sess.streamCap != nil {
+		_ = sess.streamCap.StopStream(context.Background())
+	}
+	if sess.enc != nil {
+		// The x264 C library will crash (SIGSEGV/SIGABRT) if encoder is freed
+		// while a concurrent encode call is in progress.
+		sess.enc.Close()
+	}
 	// Release shared resources via pool (ref-counted).
-	sm.pool.ReleaseFrameSource(sess.deviceID, sess.maxWidth)
+	if sess.frameSource != nil {
+		sm.pool.ReleaseFrameSource(sess.deviceID, sess.maxWidth)
+	}
 	sm.pool.ReleaseDevice(sess.deviceID)
 	log.Printf("[session %s] closed", sess.sessionID)
 	// Note: caller must call resetIdleTimer() after deleting from sm.sessions.
@@ -331,6 +386,11 @@ func (sm *SessionManager) runPipeline(sess *streamSession) {
 		return
 	case <-time.After(30 * time.Second):
 		log.Printf("[session %s] WebRTC connection timed out", sess.sessionID)
+		return
+	}
+
+	if sess.nalSource != nil {
+		sm.runNALPipeline(sess)
 		return
 	}
 
@@ -474,6 +534,91 @@ func (sm *SessionManager) runPipeline(sess *streamSession) {
 			}
 			activityTimer.Reset(activityTimeout)
 		}
+	}
+}
+
+func (sm *SessionManager) runNALPipeline(sess *streamSession) {
+	id, nals := sess.nalSource.Subscribe()
+	defer sess.nalSource.Unsubscribe(id)
+
+	log.Printf("[session %s] NAL pipeline started", sess.sessionID)
+	defer log.Printf("[session %s] NAL pipeline stopped", sess.sessionID)
+
+	const activityTimeout = 15 * time.Second
+	activityTimer := time.NewTimer(activityTimeout)
+	defer activityTimer.Stop()
+
+	var (
+		lastPTSUs      int64
+		written        uint64
+		totalWriteByte uint64
+		statsStart     = time.Now()
+	)
+
+	for {
+		select {
+		case <-sess.peer.Done():
+			return
+		case <-activityTimer.C:
+			log.Printf("[session %s] NAL activity timeout (%v with no samples), closing", sess.sessionID, activityTimeout)
+			go sm.StopSession(sess.sessionID)
+			return
+		case unit, ok := <-nals:
+			if !ok {
+				return
+			}
+
+			duration := time.Second / 30
+			if lastPTSUs > 0 && unit.PTSUs > lastPTSUs {
+				duration = time.Duration(unit.PTSUs-lastPTSUs) * time.Microsecond
+				if duration <= 0 || duration > 2*time.Second {
+					duration = time.Second / 30
+				}
+			}
+			lastPTSUs = unit.PTSUs
+
+			if err := sess.peer.WriteVideoSample(unit.Data, duration); err != nil {
+				log.Printf("[session %s] NAL write error: %v", sess.sessionID, err)
+				return
+			}
+			written++
+			totalWriteByte += uint64(len(unit.Data))
+
+			if !activityTimer.Stop() {
+				select {
+				case <-activityTimer.C:
+				default:
+				}
+			}
+			activityTimer.Reset(activityTimeout)
+
+			if written%150 == 0 {
+				elapsed := time.Since(statsStart).Seconds()
+				fps := float64(0)
+				if elapsed > 0 {
+					fps = float64(written) / elapsed
+				}
+				log.Printf("[session %s] NAL stats: written=%d bytes=%d fps=%.1f elapsed=%.1fs",
+					sess.sessionID, written, totalWriteByte, fps, elapsed)
+			}
+		}
+	}
+}
+
+func estimateAndroidBitrate(width, height, fps int) int {
+	pixels := width * height
+	switch {
+	case pixels <= 640*360:
+		return 800_000
+	case pixels <= 960*540:
+		return 1_200_000
+	case pixels <= 1280*720:
+		return 2_000_000
+	default:
+		if fps > 45 {
+			return 4_000_000
+		}
+		return 3_000_000
 	}
 }
 

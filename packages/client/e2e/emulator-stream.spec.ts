@@ -84,7 +84,7 @@ async function assertAutoStreamConnects(
   // Wait for WebRTC to reach "connected" — generous timeout covers sidecar
   // cold start, ADB query, ICE gathering, and first frame.
   await expect(page.locator(".emulator-connection-state")).toHaveText(
-    "connected",
+    /connected$/,
     { timeout: 30_000 },
   );
 

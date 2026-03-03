@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -28,6 +30,10 @@ const (
 	androidDialAttemptTimeout     = 1500 * time.Millisecond
 	androidHandshakeTimeout       = 2 * time.Second
 	androidRetryDelay             = 200 * time.Millisecond
+	defaultStreamBitrateBps       = 2_000_000
+	defaultStreamFPS              = 30
+	streamStartTimeout            = 1500 * time.Millisecond
+	streamReadPollTimeout         = 200 * time.Millisecond
 )
 
 // AndroidDevice communicates with the on-device server through an adb-forwarded TCP socket.
@@ -52,6 +58,20 @@ type AndroidDevice struct {
 	writeMu   sync.Mutex
 	closeOnce sync.Once
 	closeErr  error
+
+	streamMu     sync.Mutex
+	streaming    bool
+	streamStopCh chan struct{}
+	streamDoneCh chan struct{}
+	nalSource    *NalSource
+	startedCh    chan struct{}
+	statusCh     chan streamStatus
+}
+
+type streamStatus struct {
+	Cmd   string `json:"cmd"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
 }
 
 // NewAndroidDevice pushes/starts the on-device server, sets up adb forwarding,
@@ -310,9 +330,299 @@ func readHandshakeDimensions(reader io.Reader) (int32, int32, error) {
 	return int32(binary.LittleEndian.Uint16(buf[:2])), int32(binary.LittleEndian.Uint16(buf[2:4])), nil
 }
 
+// StartStream enables push-based H.264 streaming on supported device-server builds.
+// Older servers ignore stream commands; this method times out and returns an error,
+// allowing callers to fall back to GetFrame()+x264.
+func (d *AndroidDevice) StartStream(ctx context.Context, opts StreamOptions) (*NalSource, error) {
+	d.streamMu.Lock()
+	if d.streaming && d.nalSource != nil {
+		source := d.nalSource
+		d.streamMu.Unlock()
+		return source, nil
+	}
+
+	width := opts.Width
+	height := opts.Height
+	if width <= 0 || height <= 0 {
+		sw, sh := d.ScreenSize()
+		width = int(sw)
+		height = int(sh)
+	}
+	if width <= 0 {
+		width = 720
+	}
+	if height <= 0 {
+		height = 1280
+	}
+
+	bitrate := opts.BitrateBps
+	if bitrate <= 0 {
+		bitrate = defaultStreamBitrateBps
+	}
+	fps := opts.FPS
+	if fps <= 0 {
+		fps = defaultStreamFPS
+	}
+
+	d.streamStopCh = make(chan struct{})
+	d.streamDoneCh = make(chan struct{})
+	d.startedCh = make(chan struct{})
+	d.statusCh = make(chan streamStatus, 4)
+	d.nalSource = NewNalSource()
+	d.streaming = true
+	d.streamMu.Unlock()
+
+	payload, err := json.Marshal(struct {
+		Cmd     string `json:"cmd"`
+		Width   int    `json:"width"`
+		Height  int    `json:"height"`
+		Bitrate int    `json:"bitrate"`
+		FPS     int    `json:"fps"`
+	}{
+		Cmd:     "stream_start",
+		Width:   width,
+		Height:  height,
+		Bitrate: bitrate,
+		FPS:     fps,
+	})
+	if err != nil {
+		_ = d.StopStream(context.Background())
+		return nil, fmt.Errorf("marshal stream_start payload: %w", err)
+	}
+	if err := d.writeControl(payload); err != nil {
+		_ = d.StopStream(context.Background())
+		return nil, fmt.Errorf("send stream_start: %w", err)
+	}
+
+	go d.runStreamReader(d.streamStopCh, d.streamDoneCh, d.nalSource, d.startedCh, d.statusCh)
+
+	timeout := streamStartTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			_ = d.StopStream(context.Background())
+			return nil, ctx.Err()
+		case st := <-d.statusCh:
+			if st.Cmd == "stream_start" {
+				if !st.OK {
+					_ = d.StopStream(context.Background())
+					if st.Error == "" {
+						st.Error = "stream_start rejected"
+					}
+					return nil, errors.New(st.Error)
+				}
+				return d.nalSource, nil
+			}
+		case <-d.startedCh:
+			return d.nalSource, nil
+		case <-timer.C:
+			_ = d.StopStream(context.Background())
+			return nil, fmt.Errorf("stream start timed out (device server may be legacy)")
+		}
+	}
+}
+
+// StopStream disables push-based streaming.
+func (d *AndroidDevice) StopStream(ctx context.Context) error {
+	_ = ctx
+
+	d.streamMu.Lock()
+	if !d.streaming {
+		d.streamMu.Unlock()
+		return nil
+	}
+	stopCh := d.streamStopCh
+	doneCh := d.streamDoneCh
+	nalSource := d.nalSource
+	d.streaming = false
+	d.streamStopCh = nil
+	d.streamDoneCh = nil
+	d.nalSource = nil
+	d.startedCh = nil
+	d.statusCh = nil
+	d.streamMu.Unlock()
+
+	// Best effort: if the server supports stream controls, request clean stop.
+	payload, _ := json.Marshal(struct {
+		Cmd string `json:"cmd"`
+	}{Cmd: "stream_stop"})
+	_ = d.writeControl(payload)
+
+	if stopCh != nil {
+		close(stopCh)
+	}
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+		case <-time.After(1 * time.Second):
+		}
+	}
+	if nalSource != nil {
+		nalSource.Stop()
+	}
+	return nil
+}
+
+func (d *AndroidDevice) SetStreamBitrate(ctx context.Context, bps int) error {
+	_ = ctx
+	if bps <= 0 {
+		return nil
+	}
+	payload, err := json.Marshal(struct {
+		Cmd string `json:"cmd"`
+		Bps int    `json:"bps"`
+	}{
+		Cmd: "stream_bitrate",
+		Bps: bps,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal stream_bitrate payload: %w", err)
+	}
+	return d.writeControl(payload)
+}
+
+func (d *AndroidDevice) RequestStreamKeyframe(ctx context.Context) error {
+	_ = ctx
+	payload, err := json.Marshal(struct {
+		Cmd string `json:"cmd"`
+	}{Cmd: "stream_keyframe"})
+	if err != nil {
+		return fmt.Errorf("marshal stream_keyframe payload: %w", err)
+	}
+	return d.writeControl(payload)
+}
+
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+func (d *AndroidDevice) runStreamReader(
+	stopCh <-chan struct{},
+	doneCh chan<- struct{},
+	nalSource *NalSource,
+	startedCh chan struct{},
+	statusCh chan<- streamStatus,
+) {
+	defer close(doneCh)
+
+	started := false
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		if rd, ok := d.rw.(readDeadliner); ok {
+			_ = rd.SetReadDeadline(time.Now().Add(streamReadPollTimeout))
+		}
+		msgType, err := d.readStreamTypeByte()
+		if rd, ok := d.rw.(readDeadliner); ok {
+			_ = rd.SetReadDeadline(time.Time{})
+		}
+		if err != nil {
+			if isTimeoutError(err) {
+				continue
+			}
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				log.Printf("[AndroidDevice] stream reader error: %v", err)
+			}
+			return
+		}
+
+		switch msgType {
+		case conn.TypeStreamStatus:
+			msg, err := d.readLengthPrefixedPayload()
+			if err != nil {
+				log.Printf("[AndroidDevice] read stream status: %v", err)
+				return
+			}
+			var st streamStatus
+			if err := json.Unmarshal(msg, &st); err != nil {
+				log.Printf("[AndroidDevice] bad stream status JSON: %v", err)
+				continue
+			}
+			select {
+			case statusCh <- st:
+			default:
+			}
+		case conn.TypeStreamNAL:
+			nal, err := conn.ReadStreamNALBody(d.reader)
+			if err != nil {
+				log.Printf("[AndroidDevice] read stream NAL: %v", err)
+				return
+			}
+			unit := &NalUnit{
+				Data:     nal.Data,
+				Keyframe: (nal.Flags & 0x01) != 0,
+				Config:   (nal.Flags & 0x02) != 0,
+				PTSUs:    int64(nal.PTSUs),
+			}
+			nalSource.Publish(unit)
+			if !started {
+				started = true
+				close(startedCh)
+			}
+		default:
+			// Ignore unrelated packets while streaming (legacy frame/control traffic).
+			if msgType == conn.TypeFrameResponse ||
+				msgType == conn.TypeControl ||
+				msgType == conn.TypeStreamStatus {
+				if _, err := d.readLengthPrefixedPayload(); err != nil {
+					log.Printf("[AndroidDevice] drain payload for type 0x%02x: %v", msgType, err)
+					return
+				}
+				continue
+			}
+			log.Printf("[AndroidDevice] unknown stream packet type: 0x%02x", msgType)
+		}
+	}
+}
+
+func (d *AndroidDevice) readStreamTypeByte() (byte, error) {
+	var typeBuf [1]byte
+	if _, err := io.ReadFull(d.reader, typeBuf[:]); err != nil {
+		return 0, err
+	}
+	return typeBuf[0], nil
+}
+
+func (d *AndroidDevice) readLengthPrefixedPayload() ([]byte, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(d.reader, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	payloadLen := binary.LittleEndian.Uint32(lenBuf[:])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(d.reader, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // GetFrame requests a frame and decodes the returned JPEG into RGB888.
 func (d *AndroidDevice) GetFrame(ctx context.Context, maxWidth int) (*Frame, error) {
 	_ = ctx
+
+	d.streamMu.Lock()
+	streaming := d.streaming
+	d.streamMu.Unlock()
+	if streaming {
+		return nil, fmt.Errorf("GetFrame unavailable while stream mode is active")
+	}
 
 	d.writeMu.Lock()
 	if err := d.applyCaptureSettingsLocked(maxWidth); err != nil {
@@ -442,6 +752,10 @@ func (d *AndroidDevice) Close() error {
 			if err != nil && firstErr == nil {
 				firstErr = err
 			}
+		}
+
+		if err := d.StopStream(context.Background()); err != nil {
+			setErr(err)
 		}
 
 		if d.rw != nil {

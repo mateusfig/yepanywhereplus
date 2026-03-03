@@ -98,3 +98,56 @@ func TestReadMessageRejectsUnknownType(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestStreamStatusRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	payload := []byte(`{"cmd":"stream_start","ok":true}`)
+
+	if err := WriteStreamStatus(&buf, payload); err != nil {
+		t.Fatalf("WriteStreamStatus: %v", err)
+	}
+
+	msgType, got, err := ReadMessage(&buf)
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if msgType != TypeStreamStatus {
+		t.Fatalf("expected TypeStreamStatus, got 0x%02x", msgType)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
+func TestStreamNALRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	const flags byte = 0x03
+	const pts uint64 = 123456
+	payload := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88}
+
+	if err := WriteStreamNAL(&buf, flags, pts, payload); err != nil {
+		t.Fatalf("WriteStreamNAL: %v", err)
+	}
+
+	var msgType [1]byte
+	if _, err := io.ReadFull(&buf, msgType[:]); err != nil {
+		t.Fatalf("read msg type: %v", err)
+	}
+	if msgType[0] != TypeStreamNAL {
+		t.Fatalf("expected TypeStreamNAL, got 0x%02x", msgType[0])
+	}
+
+	got, err := ReadStreamNALBody(&buf)
+	if err != nil {
+		t.Fatalf("ReadStreamNALBody: %v", err)
+	}
+	if got.Flags != flags {
+		t.Fatalf("flags mismatch: got 0x%02x want 0x%02x", got.Flags, flags)
+	}
+	if got.PTSUs != pts {
+		t.Fatalf("pts mismatch: got %d want %d", got.PTSUs, pts)
+	}
+	if !bytes.Equal(got.Data, payload) {
+		t.Fatalf("payload mismatch")
+	}
+}

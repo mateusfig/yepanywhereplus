@@ -282,3 +282,189 @@ func TestConnectWithHandshakeRetryRecoversAfterInitialEOF(t *testing.T) {
 		t.Fatalf("unexpected handshake dimensions: %dx%d", width, height)
 	}
 }
+
+func TestAndroidDeviceStartStreamFallsBackToGetFrameOnLegacyServer(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		defer serverConn.Close()
+
+		var handshake [4]byte
+		binary.LittleEndian.PutUint16(handshake[:2], 1080)
+		binary.LittleEndian.PutUint16(handshake[2:], 2340)
+		if _, err := serverConn.Write(handshake[:]); err != nil {
+			done <- err
+			return
+		}
+
+		// Legacy behavior: stream_start command is accepted as generic control but no response/NALs.
+		msgType, payload, err := conn.ReadMessage(serverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		if msgType != conn.TypeControl || !strings.Contains(string(payload), `"cmd":"stream_start"`) {
+			done <- errString("expected stream_start control")
+			return
+		}
+
+		// Client should timeout and send stream_stop best-effort.
+		msgType, payload, err = conn.ReadMessage(serverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		if msgType != conn.TypeControl || !strings.Contains(string(payload), `"cmd":"stream_stop"`) {
+			done <- errString("expected stream_stop control")
+			return
+		}
+
+		msgType, _, err = conn.ReadMessage(serverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		if msgType != conn.TypeFrameRequest {
+			done <- errUnexpectedMessageType(msgType)
+			return
+		}
+		if err := conn.WriteFrameResponse(serverConn, testJPEG(2, 1)); err != nil {
+			done <- err
+			return
+		}
+
+		done <- nil
+	}()
+
+	d, err := NewAndroidDeviceWithTransport("R3CN90ABCDE", clientConn, nil)
+	if err != nil {
+		t.Fatalf("new device: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := d.StartStream(ctx, StreamOptions{Width: 720, Height: 1280, FPS: 30, BitrateBps: 2_000_000}); err == nil {
+		t.Fatal("expected StartStream to fail on legacy server")
+	}
+
+	if _, err := d.GetFrame(context.Background(), 0); err != nil {
+		t.Fatalf("GetFrame after stream fallback: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("mock server goroutine: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for mock server goroutine")
+	}
+}
+
+func TestAndroidDeviceStartStreamReceivesNALOnSupportedServer(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		defer serverConn.Close()
+
+		var handshake [4]byte
+		binary.LittleEndian.PutUint16(handshake[:2], 1080)
+		binary.LittleEndian.PutUint16(handshake[2:], 2340)
+		if _, err := serverConn.Write(handshake[:]); err != nil {
+			done <- err
+			return
+		}
+
+		msgType, payload, err := conn.ReadMessage(serverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		if msgType != conn.TypeControl || !strings.Contains(string(payload), `"cmd":"stream_start"`) {
+			done <- errString("expected stream_start control")
+			return
+		}
+
+		if err := conn.WriteStreamStatus(serverConn, []byte(`{"cmd":"stream_start","ok":true}`)); err != nil {
+			done <- err
+			return
+		}
+
+		// Give subscriber setup a moment before first NAL.
+		time.Sleep(50 * time.Millisecond)
+		if err := conn.WriteStreamNAL(
+			serverConn,
+			0x03,
+			123_456,
+			[]byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88},
+		); err != nil {
+			done <- err
+			return
+		}
+
+		msgType, payload, err = conn.ReadMessage(serverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		if msgType != conn.TypeControl || !strings.Contains(string(payload), `"cmd":"stream_stop"`) {
+			done <- errString("expected stream_stop control")
+			return
+		}
+
+		done <- nil
+	}()
+
+	d, err := NewAndroidDeviceWithTransport("R3CN90ABCDE", clientConn, nil)
+	if err != nil {
+		t.Fatalf("new device: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	source, err := d.StartStream(ctx, StreamOptions{Width: 720, Height: 1280, FPS: 30, BitrateBps: 2_000_000})
+	if err != nil {
+		t.Fatalf("StartStream: %v", err)
+	}
+
+	id, ch := source.Subscribe()
+	defer source.Unsubscribe(id)
+
+	select {
+	case unit := <-ch:
+		if unit == nil {
+			t.Fatal("expected NAL unit, got nil")
+		}
+		if !unit.Keyframe || !unit.Config {
+			t.Fatalf("expected keyframe+config flags, got keyframe=%v config=%v", unit.Keyframe, unit.Config)
+		}
+		if unit.PTSUs != 123_456 {
+			t.Fatalf("unexpected pts: %d", unit.PTSUs)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for NAL unit")
+	}
+
+	if err := d.StopStream(context.Background()); err != nil {
+		t.Fatalf("StopStream: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("mock server goroutine: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for mock server goroutine")
+	}
+}

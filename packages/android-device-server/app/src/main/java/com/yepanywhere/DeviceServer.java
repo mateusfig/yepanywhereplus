@@ -2,6 +2,12 @@ package com.yepanywhere;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Rect;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaFormat;
+import android.os.Bundle;
+import android.view.Surface;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -46,18 +52,24 @@ import java.util.concurrent.atomic.AtomicReference;
  * - Frame response (device -> sidecar): [0x02][len u32 LE][jpeg bytes]
  * - Control (sidecar -> device): [0x03][len u32 LE][json bytes]
  *   - {"cmd":"capture_settings","maxWidth":360} to request on-device downscaling
+ * - Stream status (device -> sidecar): [0x04][len u32 LE][json bytes]
+ * - Stream NAL (device -> sidecar): [0x05][flags u8][pts u64 LE][len u32 LE][h264 bytes]
  */
 public final class DeviceServer {
     private static final int PORT = 27183;
     private static final byte TYPE_FRAME_REQUEST = 0x01;
     private static final byte TYPE_FRAME_RESPONSE = 0x02;
     private static final byte TYPE_CONTROL = 0x03;
+    private static final byte TYPE_STREAM_STATUS = 0x04;
+    private static final byte TYPE_STREAM_NAL = 0x05;
 
     private static final int JPEG_QUALITY = 70;
     private static final int TAP_SLOP_PX = 24;
     private static final int MIN_SWIPE_DURATION_MS = 80;
     private static final int MAX_SWIPE_DURATION_MS = 1200;
     private static final int MAX_CAPTURE_WIDTH = 4096;
+    private static final int MAX_STREAM_WIDTH = 4096;
+    private static final int MAX_STREAM_HEIGHT = 4096;
     private static volatile FrameCapturer frameCapturer = createFrameCapturer();
     private static volatile int captureMaxWidth = 0; // 0 => native width
 
@@ -85,37 +97,47 @@ public final class DeviceServer {
     private static void handleClient(Socket client) throws IOException {
         client.setTcpNoDelay(true);
         TouchTracker touchTracker = new TouchTracker();
+        final Object writeLock = new Object();
 
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(client.getInputStream()));
              BufferedOutputStream out = new BufferedOutputStream(client.getOutputStream())) {
+            MediaCodecStreamer streamer = new MediaCodecStreamer(out, writeLock);
 
             Frame frame = captureFrame();
-            writeHandshake(out, frame.screenWidth, frame.screenHeight);
+            synchronized (writeLock) {
+                writeHandshake(out, frame.screenWidth, frame.screenHeight);
+            }
 
-            while (true) {
-                int msgType = in.read();
-                if (msgType < 0) {
-                    return;
-                }
-
-                if (msgType == TYPE_FRAME_REQUEST) {
-                    frame = captureFrame();
-                    writeLengthPrefixed(out, TYPE_FRAME_RESPONSE, frame.jpeg);
-                    continue;
-                }
-
-                if (msgType == TYPE_CONTROL) {
-                    int len = readLengthLE(in);
-                    if (len < 0 || len > (4 * 1024 * 1024)) {
-                        throw new IOException("invalid control payload length: " + len);
+            try {
+                while (true) {
+                    int msgType = in.read();
+                    if (msgType < 0) {
+                        return;
                     }
-                    byte[] payload = new byte[len];
-                    in.readFully(payload);
-                    handleControl(payload, frame.screenWidth, frame.screenHeight, touchTracker);
-                    continue;
-                }
 
-                throw new IOException(String.format(Locale.US, "unknown message type: 0x%02x", msgType));
+                    if (msgType == TYPE_FRAME_REQUEST) {
+                        frame = captureFrame();
+                        synchronized (writeLock) {
+                            writeLengthPrefixed(out, TYPE_FRAME_RESPONSE, frame.jpeg);
+                        }
+                        continue;
+                    }
+
+                    if (msgType == TYPE_CONTROL) {
+                        int len = readLengthLE(in);
+                        if (len < 0 || len > (4 * 1024 * 1024)) {
+                            throw new IOException("invalid control payload length: " + len);
+                        }
+                        byte[] payload = new byte[len];
+                        in.readFully(payload);
+                        handleControl(payload, frame.screenWidth, frame.screenHeight, touchTracker, streamer);
+                        continue;
+                    }
+
+                    throw new IOException(String.format(Locale.US, "unknown message type: 0x%02x", msgType));
+                }
+            } finally {
+                streamer.stop();
             }
         }
     }
@@ -137,13 +159,78 @@ public final class DeviceServer {
         out.flush();
     }
 
+    private static void writeStreamStatus(
+        OutputStream out,
+        Object writeLock,
+        String cmd,
+        boolean ok,
+        String error,
+        int width,
+        int height,
+        int bitrate,
+        int fps
+    ) {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("cmd", cmd);
+            payload.put("ok", ok);
+            if (error != null && !error.isEmpty()) {
+                payload.put("error", error);
+            }
+            if (width > 0) {
+                payload.put("width", width);
+            }
+            if (height > 0) {
+                payload.put("height", height);
+            }
+            if (bitrate > 0) {
+                payload.put("bitrate", bitrate);
+            }
+            if (fps > 0) {
+                payload.put("fps", fps);
+            }
+
+            byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
+            synchronized (writeLock) {
+                writeLengthPrefixed(out, TYPE_STREAM_STATUS, bytes);
+            }
+        } catch (Throwable t) {
+            logError("write stream status failed", t);
+        }
+    }
+
+    private static void writeStreamNal(
+        OutputStream out,
+        Object writeLock,
+        byte flags,
+        long ptsUs,
+        byte[] payload
+    ) throws IOException {
+        ByteBuffer header = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN);
+        header.put(TYPE_STREAM_NAL);
+        header.put(flags);
+        header.putLong(ptsUs);
+        header.putInt(payload.length);
+        synchronized (writeLock) {
+            out.write(header.array());
+            out.write(payload);
+            out.flush();
+        }
+    }
+
     private static int readLengthLE(DataInputStream in) throws IOException {
         byte[] lenBytes = new byte[4];
         in.readFully(lenBytes);
         return ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
     }
 
-    private static void handleControl(byte[] payload, int width, int height, TouchTracker touchTracker) {
+    private static void handleControl(
+        byte[] payload,
+        int width,
+        int height,
+        TouchTracker touchTracker,
+        MediaCodecStreamer streamer
+    ) {
         String raw = new String(payload, StandardCharsets.UTF_8);
         try {
             JSONObject obj = new JSONObject(raw);
@@ -157,6 +244,18 @@ public final class DeviceServer {
                     break;
                 case "capture_settings":
                     handleCaptureSettings(obj);
+                    break;
+                case "stream_start":
+                    streamer.start(obj, width, height);
+                    break;
+                case "stream_stop":
+                    streamer.stop();
+                    break;
+                case "stream_bitrate":
+                    streamer.setBitrate(obj.optInt("bps", 0));
+                    break;
+                case "stream_keyframe":
+                    streamer.requestKeyframe();
                     break;
                 default:
                     log("unknown control cmd: " + cmd);
@@ -434,6 +533,62 @@ public final class DeviceServer {
         } catch (NoSuchMethodException ignored) {
             return null;
         }
+    }
+
+    private static Method findMethodOptionalByArity(Class<?> owner, String name, int arity) {
+        for (Method m : allMethods(owner)) {
+            if (!m.getName().equals(name)) {
+                continue;
+            }
+            if (m.getParameterTypes().length != arity) {
+                continue;
+            }
+            m.setAccessible(true);
+            return m;
+        }
+        return null;
+    }
+
+    private static Object getPhysicalDisplayToken() throws Exception {
+        // Android 14+ moved physical-display helpers to DisplayControl.
+        try {
+            Class<?> displayControlClass = Class.forName("android.view.DisplayControl");
+            Method getIds = findMethodOptional(displayControlClass, "getPhysicalDisplayIds");
+            Method getToken = findMethodOptional(displayControlClass, "getPhysicalDisplayToken", long.class);
+            if (getIds != null && getToken != null) {
+                Object idsObj = getIds.invoke(null);
+                if (idsObj instanceof long[]) {
+                    long[] ids = (long[]) idsObj;
+                    if (ids.length > 0) {
+                        Object token = getToken.invoke(null, ids[0]);
+                        if (token != null) {
+                            return token;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fall through to older SurfaceControl methods.
+        }
+
+        Class<?> surfaceControlClass = Class.forName("android.view.SurfaceControl");
+        Method getInternalToken = findMethodOptional(surfaceControlClass, "getInternalDisplayToken");
+        if (getInternalToken != null) {
+            Object token = getInternalToken.invoke(null);
+            if (token != null) {
+                return token;
+            }
+        }
+
+        Method getBuiltInDisplay = findMethodOptional(surfaceControlClass, "getBuiltInDisplay", int.class);
+        if (getBuiltInDisplay != null) {
+            Object token = getBuiltInDisplay.invoke(null, 0);
+            if (token != null) {
+                return token;
+            }
+        }
+
+        throw new IOException("physical display token unavailable");
     }
 
     private static Constructor<?> findDisplayTokenConstructorRequired(Class<?> owner) throws NoSuchMethodException {
@@ -934,6 +1089,298 @@ public final class DeviceServer {
             }
 
             throw new IOException("could not convert screenshot object to Bitmap: " + screenshot.getClass().getName());
+        }
+    }
+
+    private static final class MediaCodecStreamer {
+        private final OutputStream out;
+        private final Object writeLock;
+        private final Object stateLock = new Object();
+
+        private volatile boolean running;
+        private Thread outputThread;
+        private MediaCodec codec;
+        private Surface inputSurface;
+        private Object virtualDisplayToken;
+        private Method destroyDisplayMethod;
+        private int streamWidth;
+        private int streamHeight;
+        private int streamBitrate;
+        private int streamFps;
+
+        MediaCodecStreamer(OutputStream out, Object writeLock) {
+            this.out = out;
+            this.writeLock = writeLock;
+        }
+
+        void start(JSONObject obj, int screenWidth, int screenHeight) {
+            int width = clamp(obj.optInt("width", screenWidth), 64, MAX_STREAM_WIDTH);
+            int height = clamp(obj.optInt("height", screenHeight), 64, MAX_STREAM_HEIGHT);
+            int bitrate = clamp(obj.optInt("bitrate", 2_000_000), 128_000, 50_000_000);
+            int fps = clamp(obj.optInt("fps", 30), 1, 120);
+
+            synchronized (stateLock) {
+                stopLocked();
+                try {
+                    configureEncoder(width, height, bitrate, fps);
+                    attachVirtualDisplay(screenWidth, screenHeight, width, height);
+                    running = true;
+                    outputThread = new Thread(this::runOutputLoop, "yep-stream-encoder");
+                    outputThread.setDaemon(true);
+                    outputThread.start();
+
+                    writeStreamStatus(
+                        out,
+                        writeLock,
+                        "stream_start",
+                        true,
+                        null,
+                        streamWidth,
+                        streamHeight,
+                        streamBitrate,
+                        streamFps
+                    );
+                } catch (Throwable t) {
+                    stopLocked();
+                    String err = t.getClass().getSimpleName() + ": " + t.getMessage();
+                    writeStreamStatus(out, writeLock, "stream_start", false, err, 0, 0, 0, 0);
+                    logError("stream_start failed", t);
+                }
+            }
+        }
+
+        void stop() {
+            synchronized (stateLock) {
+                stopLocked();
+            }
+        }
+
+        void setBitrate(int bps) {
+            if (bps <= 0) {
+                return;
+            }
+            synchronized (stateLock) {
+                if (codec == null) {
+                    writeStreamStatus(out, writeLock, "stream_bitrate", false, "stream not running", 0, 0, 0, 0);
+                    return;
+                }
+                try {
+                    Bundle params = new Bundle();
+                    params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bps);
+                    codec.setParameters(params);
+                    streamBitrate = bps;
+                    writeStreamStatus(
+                        out,
+                        writeLock,
+                        "stream_bitrate",
+                        true,
+                        null,
+                        streamWidth,
+                        streamHeight,
+                        streamBitrate,
+                        streamFps
+                    );
+                } catch (Throwable t) {
+                    writeStreamStatus(out, writeLock, "stream_bitrate", false, t.getMessage(), 0, 0, 0, 0);
+                    logError("stream_bitrate failed", t);
+                }
+            }
+        }
+
+        void requestKeyframe() {
+            synchronized (stateLock) {
+                if (codec == null) {
+                    return;
+                }
+                try {
+                    Bundle params = new Bundle();
+                    params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+                    codec.setParameters(params);
+                } catch (Throwable t) {
+                    logError("stream_keyframe failed", t);
+                }
+            }
+        }
+
+        private void runOutputLoop() {
+            MediaCodec localCodec;
+            synchronized (stateLock) {
+                localCodec = codec;
+            }
+            if (localCodec == null) {
+                return;
+            }
+
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            while (running) {
+                int index;
+                try {
+                    index = localCodec.dequeueOutputBuffer(info, 100_000);
+                } catch (Throwable t) {
+                    logError("encoder dequeue failed", t);
+                    return;
+                }
+
+                if (index == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    continue;
+                }
+                if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    continue;
+                }
+                if (index < 0) {
+                    continue;
+                }
+
+                try {
+                    ByteBuffer buf = localCodec.getOutputBuffer(index);
+                    if (buf != null && info.size > 0) {
+                        ByteBuffer dup = buf.duplicate();
+                        dup.position(info.offset);
+                        dup.limit(info.offset + info.size);
+                        byte[] payload = new byte[info.size];
+                        dup.get(payload);
+
+                        byte flags = 0;
+                        if ((info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
+                            flags |= 0x01;
+                        }
+                        if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                            flags |= 0x02;
+                        }
+                        writeStreamNal(out, writeLock, flags, info.presentationTimeUs, payload);
+                    }
+                } catch (Throwable t) {
+                    logError("write stream NAL failed", t);
+                    return;
+                } finally {
+                    try {
+                        localCodec.releaseOutputBuffer(index, false);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+
+        private void configureEncoder(int width, int height, int bitrate, int fps) throws IOException {
+            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
+            format.setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            );
+            format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
+            try {
+                format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000);
+            } catch (Throwable ignored) {
+            }
+
+            MediaCodec localCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+            localCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            Surface surface = localCodec.createInputSurface();
+            localCodec.start();
+
+            codec = localCodec;
+            inputSurface = surface;
+            streamWidth = width;
+            streamHeight = height;
+            streamBitrate = bitrate;
+            streamFps = fps;
+        }
+
+        private void attachVirtualDisplay(int screenWidth, int screenHeight, int width, int height) throws Exception {
+            Class<?> surfaceControlClass = Class.forName("android.view.SurfaceControl");
+            Method createDisplay = findMethodOptional(surfaceControlClass, "createDisplay", String.class, boolean.class);
+            Method openTransaction = findMethodOptionalByArity(surfaceControlClass, "openTransaction", 0);
+            Method closeTransaction = findMethodOptionalByArity(surfaceControlClass, "closeTransaction", 0);
+            Method setDisplaySurface = findMethodOptionalByArity(surfaceControlClass, "setDisplaySurface", 2);
+            Method setDisplayProjection = findMethodOptionalByArity(surfaceControlClass, "setDisplayProjection", 4);
+            Method setDisplayLayerStack = findMethodOptionalByArity(surfaceControlClass, "setDisplayLayerStack", 2);
+            Method destroyDisplay = findMethodOptionalByArity(surfaceControlClass, "destroyDisplay", 1);
+
+            if (createDisplay == null ||
+                openTransaction == null ||
+                closeTransaction == null ||
+                setDisplaySurface == null ||
+                setDisplayProjection == null ||
+                setDisplayLayerStack == null) {
+                throw new NoSuchMethodException("missing SurfaceControl display methods");
+            }
+
+            Object token = createDisplay.invoke(null, "yep-stream", false);
+            if (token == null) {
+                throw new IOException("SurfaceControl.createDisplay returned null");
+            }
+
+            int srcW = Math.max(1, screenWidth);
+            int srcH = Math.max(1, screenHeight);
+            Rect sourceRect = new Rect(0, 0, srcW, srcH);
+            Rect displayRect = new Rect(0, 0, Math.max(1, width), Math.max(1, height));
+
+            openTransaction.invoke(null);
+            try {
+                setDisplaySurface.invoke(null, token, inputSurface);
+                setDisplayProjection.invoke(null, token, 0, sourceRect, displayRect);
+                setDisplayLayerStack.invoke(null, token, 0);
+            } finally {
+                closeTransaction.invoke(null);
+            }
+
+            virtualDisplayToken = token;
+            destroyDisplayMethod = destroyDisplay;
+
+            // Best effort: touch physical-display token so failures surface early on new Android versions.
+            try {
+                getPhysicalDisplayToken();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private void stopLocked() {
+            running = false;
+
+            Thread t = outputThread;
+            outputThread = null;
+            if (t != null && t != Thread.currentThread()) {
+                try {
+                    t.join(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            if (codec != null) {
+                try {
+                    codec.signalEndOfInputStream();
+                } catch (Throwable ignored) {
+                }
+                try {
+                    codec.stop();
+                } catch (Throwable ignored) {
+                }
+                try {
+                    codec.release();
+                } catch (Throwable ignored) {
+                }
+                codec = null;
+            }
+
+            if (inputSurface != null) {
+                try {
+                    inputSurface.release();
+                } catch (Throwable ignored) {
+                }
+                inputSurface = null;
+            }
+
+            if (virtualDisplayToken != null && destroyDisplayMethod != null) {
+                try {
+                    destroyDisplayMethod.invoke(null, virtualDisplayToken);
+                } catch (Throwable ignored) {
+                }
+            }
+            virtualDisplayToken = null;
+            destroyDisplayMethod = null;
         }
     }
 

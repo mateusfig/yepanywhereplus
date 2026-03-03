@@ -27,3 +27,19 @@ type Device interface {
 	ScreenSize() (width, height int32)
 	Close() error
 }
+
+// StreamOptions configures on-device hardware streaming.
+type StreamOptions struct {
+	Width      int
+	Height     int
+	FPS        int
+	BitrateBps int
+}
+
+// StreamCapable is implemented by devices that can push H.264 directly.
+type StreamCapable interface {
+	StartStream(ctx context.Context, opts StreamOptions) (*NalSource, error)
+	StopStream(ctx context.Context) error
+	SetStreamBitrate(ctx context.Context, bps int) error
+	RequestStreamKeyframe(ctx context.Context) error
+}
