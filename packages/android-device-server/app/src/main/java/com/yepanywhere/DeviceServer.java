@@ -343,6 +343,13 @@ public final class DeviceServer {
         }
 
         try {
+            // `input text` is unreliable for a standalone space on some devices.
+            // Send KEYCODE_SPACE directly for literal space input.
+            if (" ".equals(key)) {
+                runCommand(new String[]{"input", "keyevent", "KEYCODE_SPACE"});
+                return;
+            }
+
             String textArg = mapPrintableKeyToInputTextArg(key);
             if (textArg != null) {
                 runCommand(new String[]{"input", "text", textArg});
@@ -368,10 +375,7 @@ public final class DeviceServer {
             return null;
         }
 
-        // `input text` expects spaces as `%s`; `%` itself must be escaped.
-        if (ch == ' ') {
-            return "%s";
-        }
+        // `%` must be escaped for `input text`.
         if (ch == '%') {
             return "%%";
         }

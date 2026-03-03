@@ -100,9 +100,10 @@
 }
 
 .emulator-stream-header {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
   padding: 8px 16px;
   border-bottom: 1px solid var(--app-border);
 }
@@ -111,6 +112,20 @@
   font-size: 0.85em;
   color: var(--app-text-secondary);
   text-transform: capitalize;
+  text-align: center;
+}
+
+.emulator-stream-header-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.emulator-keyboard-state {
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--app-border);
+  background: var(--app-bg-primary);
+  color: var(--app-text-secondary);
+  font-size: 0.75em;
 }
 
 .emulator-profile-state {

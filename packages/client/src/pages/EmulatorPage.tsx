@@ -1,5 +1,5 @@
 import type { DeviceInfo } from "@yep-anywhere/shared";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import { EmulatorNavButtons } from "../components/EmulatorNavButtons";
 import { EmulatorStream } from "../components/EmulatorStream";
@@ -51,6 +51,15 @@ function hasAction(device: DeviceInfo, action: "stream" | "start" | "stop") {
     return device.type === "emulator" && device.state !== "stopped";
   }
   return false;
+}
+
+type NavigatorKeyboard = {
+  lock?: (keyCodes?: string[]) => Promise<void>;
+  unlock?: () => void;
+};
+
+function getNavigatorKeyboard(): NavigatorKeyboard | undefined {
+  return (navigator as Navigator & { keyboard?: NavigatorKeyboard }).keyboard;
 }
 
 function EmulatorListItem({
@@ -182,6 +191,18 @@ function StreamView({
     disconnect,
   } = useEmulatorStream();
   const { adaptiveFps, maxFps } = useEmulatorSettings();
+  const streamViewRef = useRef<HTMLDivElement>(null);
+  const [immersiveKeyboardActive, setImmersiveKeyboardActive] = useState(false);
+  const [immersiveKeyboardBusy, setImmersiveKeyboardBusy] = useState(false);
+  const [immersiveKeyboardError, setImmersiveKeyboardError] = useState<
+    string | null
+  >(null);
+  const keyboardDevice =
+    device.type === "emulator" || device.type === "android";
+  const supportsImmersiveKeyboard =
+    keyboardDevice &&
+    document.fullscreenEnabled &&
+    typeof getNavigatorKeyboard()?.lock === "function";
 
   // Auto-connect when entering stream view
   useEffect(() => {
@@ -189,13 +210,70 @@ function StreamView({
     return () => disconnect();
   }, [device.id, device.type, connect, disconnect]);
 
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      const active = document.fullscreenElement === streamViewRef.current;
+      setImmersiveKeyboardActive(active);
+      if (!active) {
+        getNavigatorKeyboard()?.unlock?.();
+      }
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      getNavigatorKeyboard()?.unlock?.();
+    };
+  }, []);
+
+  const exitImmersiveKeyboard = useCallback(async () => {
+    setImmersiveKeyboardBusy(true);
+    setImmersiveKeyboardError(null);
+    try {
+      getNavigatorKeyboard()?.unlock?.();
+      if (document.fullscreenElement === streamViewRef.current) {
+        await document.exitFullscreen();
+      }
+      setImmersiveKeyboardActive(false);
+    } catch (err) {
+      setImmersiveKeyboardError(
+        `Failed to exit immersive keyboard: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setImmersiveKeyboardBusy(false);
+    }
+  }, []);
+
+  const enterImmersiveKeyboard = useCallback(async () => {
+    if (!supportsImmersiveKeyboard || !streamViewRef.current) return;
+
+    setImmersiveKeyboardBusy(true);
+    setImmersiveKeyboardError(null);
+    try {
+      if (document.fullscreenElement !== streamViewRef.current) {
+        await streamViewRef.current.requestFullscreen();
+      }
+      await getNavigatorKeyboard()?.lock?.();
+      setImmersiveKeyboardActive(true);
+    } catch (err) {
+      getNavigatorKeyboard()?.unlock?.();
+      setImmersiveKeyboardActive(false);
+      setImmersiveKeyboardError(
+        `Immersive keyboard failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setImmersiveKeyboardBusy(false);
+    }
+  }, [supportsImmersiveKeyboard]);
+
   const handleBack = () => {
+    void exitImmersiveKeyboard();
     disconnect();
     onBack();
   };
 
   return (
-    <div className="emulator-stream-view">
+    <div className="emulator-stream-view" ref={streamViewRef}>
       <div className="emulator-stream-header">
         <button
           type="button"
@@ -207,7 +285,41 @@ function StreamView({
         <span className="emulator-connection-state">
           {deviceLabel(device)} - {connectionState}
         </span>
+        <div className="emulator-stream-header-actions">
+          {supportsImmersiveKeyboard && (
+            <button
+              type="button"
+              className="emulator-btn emulator-btn-secondary"
+              onClick={() => {
+                if (immersiveKeyboardActive) {
+                  void exitImmersiveKeyboard();
+                } else {
+                  void enterImmersiveKeyboard();
+                }
+              }}
+              disabled={immersiveKeyboardBusy}
+              title="Request fullscreen and keyboard lock"
+            >
+              {immersiveKeyboardBusy
+                ? "Working..."
+                : immersiveKeyboardActive
+                  ? "Exit Immersive Keyboard"
+                  : "Immersive Keyboard"}
+            </button>
+          )}
+        </div>
       </div>
+
+      {supportsImmersiveKeyboard && (
+        <div className="emulator-keyboard-state">
+          Keyboard mode:{" "}
+          {immersiveKeyboardActive ? "immersive (fullscreen)" : "standard"}
+        </div>
+      )}
+
+      {immersiveKeyboardError && (
+        <div className="emulator-error">{immersiveKeyboardError}</div>
+      )}
 
       {latestProfileEvent && (
         <div className="emulator-profile-state">
