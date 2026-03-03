@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [site-v1.5.18] - 2026-03-03
+
+### Added
+- Blog post: Android Dev Without a Desktop — Remote Device Control
+- Device control feature card on homepage
+- Device stream screenshot in homepage and README galleries
+- Screenshots: device sidebar, device list, device stream, device settings
+
+### Changed
+- Homepage announcement banner now promotes remote device control
+
 ## [site-v1.5.17] - 2026-02-27
 
 ### Added
