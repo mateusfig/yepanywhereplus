@@ -113,7 +113,11 @@ interface CodexCommandExecution {
 interface CodexFileChange {
   id: string;
   type: "file_change";
-  changes: Array<{ path: string; kind: "add" | "delete" | "update" }>;
+  changes: Array<{
+    path: string;
+    kind: "add" | "delete" | "update";
+    diff?: string;
+  }>;
   status: "completed" | "failed";
 }
 
@@ -809,6 +813,13 @@ export class CodexOSSProvider implements AgentProvider {
         const changesSummary = item.changes
           .map((c) => `${c.kind}: ${c.path}`)
           .join("\n");
+        const editInput: Record<string, unknown> = {
+          changes: item.changes,
+        };
+        const singlePath = item.changes[0]?.path;
+        if (singlePath && item.changes.length === 1) {
+          editInput.file_path = singlePath;
+        }
 
         return [
           {
@@ -822,7 +833,7 @@ export class CodexOSSProvider implements AgentProvider {
                   type: "tool_use",
                   id: item.id,
                   name: "Edit",
-                  input: { changes: item.changes },
+                  input: editInput,
                 },
               ],
             },

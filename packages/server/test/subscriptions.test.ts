@@ -280,6 +280,72 @@ describe("createSessionSubscription", () => {
     expect(input?._structuredPatch?.length).toBeGreaterThan(0);
   });
 
+  it("augments streamed Edit file_change diffs during streaming", async () => {
+    const { process, fireEvent } = createMockProcess();
+    const { emit, events } = collectEmit();
+
+    createSessionSubscription(process, emit);
+
+    await fireEvent({
+      type: "message",
+      message: {
+        type: "assistant",
+        uuid: "msg-file-change-1",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-edit-file-change-1",
+              name: "Edit",
+              input: {
+                changes: [
+                  {
+                    path: "src/example.ts",
+                    kind: "update",
+                    diff: [
+                      "diff --git a/src/example.ts b/src/example.ts",
+                      "--- a/src/example.ts",
+                      "+++ b/src/example.ts",
+                      "@@ -1,1 +1,1 @@",
+                      "-const a = 1;",
+                      "+const a = 2;",
+                    ].join("\n"),
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    } as ProcessEvent);
+
+    const messageEvent = events.find(
+      ([type, payload]) =>
+        type === "message" &&
+        (payload as { uuid?: string })?.uuid === "msg-file-change-1",
+    );
+    expect(messageEvent).toBeDefined();
+
+    const payload = messageEvent?.[1] as {
+      message?: {
+        content?: Array<{
+          type?: string;
+          input?: {
+            _rawPatch?: string;
+            _structuredPatch?: Array<unknown>;
+          };
+        }>;
+      };
+    };
+    const firstBlock = payload.message?.content?.[0];
+    const input = firstBlock?.input;
+
+    expect(firstBlock?.type).toBe("tool_use");
+    expect(input?._rawPatch).toContain("diff --git a/src/example.ts");
+    expect(Array.isArray(input?._structuredPatch)).toBe(true);
+    expect(input?._structuredPatch?.length).toBeGreaterThan(0);
+  });
+
   it("emits complete and stops further events", async () => {
     const { process, fireEvent } = createMockProcess();
     const { emit, events } = collectEmit();

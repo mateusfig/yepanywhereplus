@@ -131,6 +131,7 @@ interface CodexTurnRuntimeState {
 interface NormalizedFileChange {
   path: string;
   kind: "add" | "delete" | "update";
+  diff?: string;
 }
 
 type NormalizedThreadItem =
@@ -1632,7 +1633,12 @@ export class CodexProvider implements AgentProvider {
             }
           }
 
-          changes.push({ path, kind });
+          const diff = this.getOptionalString(record.diff) ?? undefined;
+          changes.push({
+            path,
+            kind,
+            ...(diff ? { diff } : {}),
+          });
         }
 
         return {
@@ -1977,6 +1983,13 @@ export class CodexProvider implements AgentProvider {
         const changesSummary = item.changes
           .map((c) => `${c.kind}: ${c.path}`)
           .join("\n");
+        const editInput: Record<string, unknown> = {
+          changes: item.changes,
+        };
+        const singlePath = item.changes[0]?.path;
+        if (singlePath && item.changes.length === 1) {
+          editInput.file_path = singlePath;
+        }
 
         return [
           {
@@ -1990,7 +2003,7 @@ export class CodexProvider implements AgentProvider {
                   type: "tool_use",
                   id: item.id,
                   name: "Edit",
-                  input: { changes: item.changes },
+                  input: editInput,
                 },
               ],
             },

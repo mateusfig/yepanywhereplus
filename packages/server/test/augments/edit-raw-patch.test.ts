@@ -43,6 +43,32 @@ describe("parseRawEditPatch", () => {
     expect(parsed).not.toBeNull();
     expect(parsed?.structuredPatch).toEqual([]);
   });
+
+  it("parses unified diff content without apply_patch markers", () => {
+    const rawPatch = [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "--- a/src/example.ts",
+      "+++ b/src/example.ts",
+      "@@ -1,2 +1,2 @@",
+      "-const x = 1;",
+      "+const x = 2;",
+      " const y = 3;",
+      "",
+    ].join("\n");
+
+    const parsed = parseRawEditPatch(rawPatch);
+
+    expect(parsed).not.toBeNull();
+    expect(parsed?.filePath).toBe("src/example.ts");
+    expect(parsed?.structuredPatch).toHaveLength(1);
+    expect(parsed?.structuredPatch[0]?.oldStart).toBe(1);
+    expect(parsed?.structuredPatch[0]?.newStart).toBe(1);
+    expect(parsed?.structuredPatch[0]?.lines).toEqual([
+      "-const x = 1;",
+      "+const x = 2;",
+      " const y = 3;",
+    ]);
+  });
 });
 
 describe("extractRawPatchFromEditInput", () => {
@@ -52,5 +78,26 @@ describe("extractRawPatchFromEditInput", () => {
       input: { patch: rawPatch },
     });
     expect(extracted).toBe(rawPatch);
+  });
+
+  it("extracts and combines diffs from codex file_change shapes", () => {
+    const extracted = extractRawPatchFromEditInput({
+      changes: [
+        {
+          path: "src/a.ts",
+          kind: "update",
+          diff: "@@ -1 +1 @@\n-a\n+b\n",
+        },
+        {
+          path: "src/b.ts",
+          kind: "update",
+          diff: "@@ -1 +1 @@\n-c\n+d\n",
+        },
+      ],
+    });
+
+    expect(extracted).toContain("@@ -1 +1 @@");
+    expect(extracted).toContain("-a");
+    expect(extracted).toContain("+d");
   });
 });

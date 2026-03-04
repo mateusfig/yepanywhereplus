@@ -51,6 +51,28 @@ function countNewLines(lines: string[]): number {
   return count;
 }
 
+function extractRawPatchFromChanges(changes: unknown): string | undefined {
+  if (!Array.isArray(changes)) {
+    return undefined;
+  }
+
+  const diffs = changes
+    .map((change) => {
+      if (!isRecord(change)) return null;
+      const diff = change.diff;
+      if (typeof diff !== "string") return null;
+      const trimmed = diff.trim();
+      return trimmed ? trimmed : null;
+    })
+    .filter((diff): diff is string => typeof diff === "string");
+
+  if (diffs.length === 0) {
+    return undefined;
+  }
+
+  return diffs.join("\n\n");
+}
+
 export function extractRawPatchFromEditInput(
   input: unknown,
 ): string | undefined {
@@ -69,12 +91,18 @@ export function extractRawPatchFromEditInput(
     "content",
     "text",
     "raw",
+    "diff",
   ];
   for (const key of directKeys) {
     const value = input[key];
     if (typeof value === "string") {
       return value;
     }
+  }
+
+  const patchFromChanges = extractRawPatchFromChanges(input.changes);
+  if (patchFromChanges) {
+    return patchFromChanges;
   }
 
   const nestedInput = input.input;
@@ -88,108 +116,168 @@ export function extractRawPatchFromEditInput(
   return undefined;
 }
 
-export function parseRawEditPatch(rawPatch: string): ParsedRawEditPatch | null {
-  try {
-    if (!rawPatch.includes(PATCH_START_MARKER)) {
-      return null;
+function normalizeUnifiedPath(pathToken: string): string | undefined {
+  const token = pathToken.trim().split(/\s+/)[0] ?? "";
+  if (!token || token === "/dev/null") {
+    return undefined;
+  }
+  return token.replace(/^[ab]\//, "");
+}
+
+function extractUnifiedFilePath(line: string): string | undefined {
+  if (line.startsWith("+++ ") || line.startsWith("--- ")) {
+    return normalizeUnifiedPath(line.slice(4));
+  }
+
+  if (line.startsWith("diff --git ")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length >= 4) {
+      return normalizeUnifiedPath(parts[3] ?? parts[2] ?? "");
+    }
+  }
+
+  return undefined;
+}
+
+function isUnifiedFileHeaderStart(lines: string[], index: number): boolean {
+  const line = lines[index] ?? "";
+  if (!line.startsWith("--- ")) {
+    return false;
+  }
+  const next = lines[index + 1] ?? "";
+  return next.startsWith("+++ ");
+}
+
+function parsePatchLines(
+  lines: string[],
+  requireApplyMarkers: boolean,
+): { structuredPatch: PatchHunk[]; filePath?: string } {
+  const structuredPatch: PatchHunk[] = [];
+
+  let filePath: string | undefined;
+  let inPatch = !requireApplyMarkers;
+  let nextOldStart = 1;
+  let nextNewStart = 1;
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+
+    if (!inPatch) {
+      if (line === PATCH_START_MARKER) {
+        inPatch = true;
+      }
+      i++;
+      continue;
     }
 
-    const lines = rawPatch.replace(/\r\n/g, "\n").split("\n");
-    const structuredPatch: PatchHunk[] = [];
+    if (requireApplyMarkers && line === PATCH_END_MARKER) {
+      break;
+    }
 
-    let filePath: string | undefined;
-    let inPatch = false;
-    let nextOldStart = 1;
-    let nextNewStart = 1;
+    const headerFilePath = extractFilePath(line);
+    if (!filePath && headerFilePath) {
+      filePath = headerFilePath;
+      i++;
+      continue;
+    }
 
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i] ?? "";
-
-      if (!inPatch) {
-        if (line === PATCH_START_MARKER) {
-          inPatch = true;
-        }
-        i++;
-        continue;
+    if (!filePath) {
+      const unifiedFilePath = extractUnifiedFilePath(line);
+      if (unifiedFilePath) {
+        filePath = unifiedFilePath;
       }
+    }
 
-      if (line === PATCH_END_MARKER) {
+    const headerMatch = line.match(HUNK_HEADER_REGEX);
+    if (!headerMatch) {
+      i++;
+      continue;
+    }
+
+    const oldStartRaw = headerMatch[1];
+    const oldLinesRaw = headerMatch[2];
+    const newStartRaw = headerMatch[3];
+    const newLinesRaw = headerMatch[4];
+    const hasRanges = oldStartRaw !== undefined && newStartRaw !== undefined;
+
+    const hunkLines: string[] = [];
+    i++;
+
+    while (i < lines.length) {
+      const hunkLine = lines[i] ?? "";
+      const isBoundary = requireApplyMarkers
+        ? hunkLine === PATCH_END_MARKER ||
+          hunkLine.startsWith("@@") ||
+          !!extractFilePath(hunkLine)
+        : hunkLine.startsWith("@@") ||
+          hunkLine.startsWith("diff --git ") ||
+          isUnifiedFileHeaderStart(lines, i);
+      if (isBoundary) {
         break;
       }
 
-      const headerFilePath = extractFilePath(line);
-      if (!filePath && headerFilePath) {
-        filePath = headerFilePath;
+      if (hunkLine === "\\ No newline at end of file") {
         i++;
         continue;
       }
 
-      const headerMatch = line.match(HUNK_HEADER_REGEX);
-      if (!headerMatch) {
-        i++;
-        continue;
+      const prefix = hunkLine[0];
+      if (prefix === " " || prefix === "-" || prefix === "+") {
+        hunkLines.push(hunkLine);
       }
 
-      const oldStartRaw = headerMatch[1];
-      const oldLinesRaw = headerMatch[2];
-      const newStartRaw = headerMatch[3];
-      const newLinesRaw = headerMatch[4];
-      const hasRanges = oldStartRaw !== undefined && newStartRaw !== undefined;
-
-      const hunkLines: string[] = [];
       i++;
+    }
 
-      while (i < lines.length) {
-        const hunkLine = lines[i] ?? "";
-        if (
-          hunkLine === PATCH_END_MARKER ||
-          hunkLine.startsWith("@@") ||
-          extractFilePath(hunkLine)
-        ) {
-          break;
-        }
-        if (hunkLine === "\\ No newline at end of file") {
-          i++;
-          continue;
-        }
+    if (hunkLines.length === 0) {
+      continue;
+    }
 
-        const prefix = hunkLine[0];
-        if (prefix === " " || prefix === "-" || prefix === "+") {
-          hunkLines.push(hunkLine);
-        }
+    const oldStart = hasRanges ? Number(oldStartRaw) : nextOldStart;
+    const newStart = hasRanges ? Number(newStartRaw) : nextNewStart;
+    const oldLines = hasRanges
+      ? Number(oldLinesRaw ?? "1")
+      : countOldLines(hunkLines);
+    const newLines = hasRanges
+      ? Number(newLinesRaw ?? "1")
+      : countNewLines(hunkLines);
 
-        i++;
-      }
+    structuredPatch.push({
+      oldStart,
+      oldLines,
+      newStart,
+      newLines,
+      lines: hunkLines,
+    });
 
-      if (hunkLines.length === 0) {
-        continue;
-      }
+    nextOldStart = oldStart + oldLines;
+    nextNewStart = newStart + newLines;
+  }
 
-      const oldStart = hasRanges ? Number(oldStartRaw) : nextOldStart;
-      const newStart = hasRanges ? Number(newStartRaw) : nextNewStart;
-      const oldLines = hasRanges
-        ? Number(oldLinesRaw ?? "1")
-        : countOldLines(hunkLines);
-      const newLines = hasRanges
-        ? Number(newLinesRaw ?? "1")
-        : countNewLines(hunkLines);
+  return { structuredPatch, filePath };
+}
 
-      structuredPatch.push({
-        oldStart,
-        oldLines,
-        newStart,
-        newLines,
-        lines: hunkLines,
-      });
+export function parseRawEditPatch(rawPatch: string): ParsedRawEditPatch | null {
+  try {
+    const lines = rawPatch.replace(/\r\n/g, "\n").split("\n");
+    if (rawPatch.includes(PATCH_START_MARKER)) {
+      const parsedApplyPatch = parsePatchLines(lines, true);
+      return {
+        structuredPatch: parsedApplyPatch.structuredPatch,
+        filePath: parsedApplyPatch.filePath,
+        rawPatch,
+      };
+    }
 
-      nextOldStart = oldStart + oldLines;
-      nextNewStart = newStart + newLines;
+    const parsedUnifiedDiff = parsePatchLines(lines, false);
+    if (parsedUnifiedDiff.structuredPatch.length === 0) {
+      return null;
     }
 
     return {
-      structuredPatch,
-      filePath,
+      structuredPatch: parsedUnifiedDiff.structuredPatch,
+      filePath: parsedUnifiedDiff.filePath,
       rawPatch,
     };
   } catch {
