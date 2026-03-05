@@ -30,6 +30,23 @@ export interface SubscriptionOptions {
 }
 
 /**
+ * Normalize provider stream message shapes before augmentation/rendering.
+ * Keep this lightweight; provider-specific heavy transforms should happen upstream.
+ */
+export function normalizeStreamMessage(
+  message: Record<string, unknown>,
+): Record<string, unknown> {
+  if (
+    message.type === "user" &&
+    message.tool_use_result === undefined &&
+    message.toolUseResult !== undefined
+  ) {
+    message.tool_use_result = message.toolUseResult;
+  }
+  return message;
+}
+
+/**
  * Create a session subscription that forwards process events via `emit`.
  *
  * Subscribes to process events BEFORE capturing state for the "connected" event,
@@ -88,7 +105,9 @@ export function createSessionSubscription(
     try {
       switch (event.type) {
         case "message": {
-          const message = event.message as Record<string, unknown>;
+          const message = normalizeStreamMessage(
+            event.message as Record<string, unknown>,
+          );
           const aug = await getAugmenter();
           await aug.processMessage(message);
           emit("message", markSubagent(message));
