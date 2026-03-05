@@ -1,14 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ZodError } from "zod";
 import { useSchemaValidationContext } from "../../../contexts/SchemaValidationContext";
+import {
+  getDisplayBashCommandFromInput,
+  isCodexProvider,
+} from "../../../lib/bashCommand";
 import { validateToolResult } from "../../../lib/validateToolResult";
 import { SchemaWarning } from "../../SchemaWarning";
 import { Modal } from "../../ui/Modal";
 import type { BashInput, BashResult, ToolRenderer } from "./types";
 
 const MAX_LINES_COLLAPSED = 20;
-const PREVIEW_LINES = 4;
-const PREVIEW_MAX_CHARS = 400; // 4 * 100 chars
+const DEFAULT_PREVIEW_LINES = 4;
+const DEFAULT_PREVIEW_MAX_CHARS = 400; // 4 * 100 chars
+const CODEX_PREVIEW_LINES = 2;
+const CODEX_PREVIEW_MAX_CHARS = 220;
+
+const CODEX_NOISE_PATTERNS = [
+  /^npm warn (?:unknown env config|config)\s+["']recursive["']/i,
+  /^this will stop working in the next major version of npm\.?$/i,
+];
 
 /**
  * Normalize bash result - handles both structured objects and plain strings
@@ -34,11 +45,46 @@ function normalizeBashResult(
 }
 
 function getBashCommand(input: BashInput): string {
-  if (typeof input.command === "string" && input.command.trim().length > 0) {
-    return input.command;
+  return getDisplayBashCommandFromInput(input);
+}
+
+function sanitizeOutputForPreview(output: string, provider?: string): string {
+  const normalized = output.replace(/\r\n/g, "\n");
+  if (!isCodexProvider(provider)) {
+    return normalized;
   }
-  const cmd = (input as BashInput & { cmd?: unknown }).cmd;
-  return typeof cmd === "string" ? cmd : "";
+
+  const lines = normalized.split("\n");
+  const filtered = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return false;
+    }
+    return !CODEX_NOISE_PATTERNS.some((pattern) => pattern.test(trimmed));
+  });
+
+  if (filtered.length === 0) {
+    return normalized;
+  }
+
+  return filtered.join("\n");
+}
+
+function getPreviewLimits(provider?: string): {
+  maxLines: number;
+  maxChars: number;
+} {
+  if (isCodexProvider(provider)) {
+    return {
+      maxLines: CODEX_PREVIEW_LINES,
+      maxChars: CODEX_PREVIEW_MAX_CHARS,
+    };
+  }
+
+  return {
+    maxLines: DEFAULT_PREVIEW_LINES,
+    maxChars: DEFAULT_PREVIEW_MAX_CHARS,
+  };
 }
 
 /**
@@ -221,17 +267,20 @@ function BashToolResult({
 /**
  * Truncate text to a maximum number of lines and characters
  */
-function truncateOutput(text: string): { text: string; truncated: boolean } {
+function truncateOutput(
+  text: string,
+  limits: { maxLines: number; maxChars: number },
+): { text: string; truncated: boolean } {
   const lines = text.split("\n");
   let result = "";
   let charCount = 0;
   let lineCount = 0;
 
   for (const line of lines) {
-    if (lineCount >= PREVIEW_LINES || charCount >= PREVIEW_MAX_CHARS) {
+    if (lineCount >= limits.maxLines || charCount >= limits.maxChars) {
       return { text: result.trimEnd(), truncated: true };
     }
-    const remaining = PREVIEW_MAX_CHARS - charCount;
+    const remaining = limits.maxChars - charCount;
     if (line.length > remaining) {
       result += `${line.slice(0, remaining)}...`;
       return { text: result.trimEnd(), truncated: true };
@@ -252,10 +301,12 @@ function BashCollapsedPreview({
   input,
   result: rawResult,
   isError,
+  provider,
 }: {
   input: BashInput;
   result: BashResult | string | undefined;
   isError: boolean;
+  provider?: string;
 }) {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const { enabled, reportValidationError, isToolIgnored } =
@@ -284,9 +335,15 @@ function BashCollapsedPreview({
   const showValidationWarning =
     enabled && validationErrors && !isToolIgnored("Bash");
 
-  const output = result?.stdout || result?.stderr || "";
+  const output = sanitizeOutputForPreview(
+    result?.stdout || result?.stderr || "",
+    provider,
+  );
   const command = getBashCommand(input);
-  const { text: previewText, truncated } = truncateOutput(output);
+  const { text: previewText, truncated } = truncateOutput(
+    output,
+    getPreviewLimits(provider),
+  );
   const hasOutput = previewText.length > 0;
 
   const handleClick = useCallback(() => {
@@ -381,12 +438,13 @@ export const bashRenderer: ToolRenderer<BashInput, BashResult> = {
     return "";
   },
 
-  renderCollapsedPreview(input, result, isError, _context) {
+  renderCollapsedPreview(input, result, isError, context) {
     return (
       <BashCollapsedPreview
         input={input as BashInput}
         result={result as BashResult | undefined}
         isError={isError}
+        provider={context.provider}
       />
     );
   },

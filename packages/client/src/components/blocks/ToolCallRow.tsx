@@ -1,4 +1,8 @@
 import { memo, useMemo, useState } from "react";
+import {
+  getDisplayBashCommandFromInput,
+  isCodexLikeBashInput,
+} from "../../lib/bashCommand";
 import type { ToolResultData } from "../../types/renderItems";
 import { toolRegistry } from "../renderers/tools";
 import type { RenderContext } from "../renderers/types";
@@ -25,10 +29,11 @@ export const ToolCallRow = memo(function ToolCallRow({
   const hasInlineRenderer = toolRegistry.hasInlineRenderer(toolName);
   // Check if this tool has interactive summary (no expand/collapse)
   const hasInteractiveSummary = toolRegistry.hasInteractiveSummary(toolName);
-  const suppressCollapsedPreview = shouldSuppressBashCollapsedPreviewForCodex(
+  const suppressCollapsedPreview = shouldSuppressBashCollapsedPreview(
     toolName,
     toolInput,
     sessionProvider,
+    status,
   );
   // Check if this tool has a collapsed preview
   const hasCollapsedPreview =
@@ -57,8 +62,9 @@ export const ToolCallRow = memo(function ToolCallRow({
       isStreaming: status === "pending",
       theme: "dark",
       toolUseId: id,
+      provider: sessionProvider,
     }),
-    [status, id],
+    [status, id, sessionProvider],
   );
 
   // Get structured result for interactive summary
@@ -171,42 +177,32 @@ export const ToolCallRow = memo(function ToolCallRow({
   );
 });
 
-function shouldSuppressBashCollapsedPreviewForCodex(
+function shouldSuppressBashCollapsedPreview(
   toolName: string,
   toolInput: unknown,
   sessionProvider?: string,
+  status?: "pending" | "complete" | "error" | "aborted",
 ): boolean {
   if (toolName !== "Bash") {
     return false;
   }
 
-  if (sessionProvider !== "codex" && sessionProvider !== "codex-oss") {
+  if (!isCodexLikeBashInput(toolInput, sessionProvider)) {
     return false;
   }
 
-  const command = extractBashCommand(toolInput);
+  // Keep completed Codex bash rows compact by default (header + expandable details),
+  // which matches the live-stream condensed row behavior and avoids persistent IN/OUT cards.
+  if (status === "complete" || status === "error" || status === "aborted") {
+    return true;
+  }
+
+  const command = getDisplayBashCommandFromInput(toolInput);
   if (!command) {
     return false;
   }
 
   return /^(rg|grep|sed|nl|cat)\b/.test(command.trimStart());
-}
-
-function extractBashCommand(toolInput: unknown): string | undefined {
-  if (!toolInput || typeof toolInput !== "object") {
-    return undefined;
-  }
-
-  const input = toolInput as Record<string, unknown>;
-  if (typeof input.command === "string" && input.command.trim().length > 0) {
-    return input.command;
-  }
-
-  if (typeof input.cmd === "string" && input.cmd.trim().length > 0) {
-    return input.cmd;
-  }
-
-  return undefined;
 }
 
 function ToolUseExpanded({
