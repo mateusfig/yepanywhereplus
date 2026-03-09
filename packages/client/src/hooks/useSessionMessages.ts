@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type PaginationInfo, api } from "../api/client";
 import {
+  getMessageTimestampMs,
+  hasEquivalentJsonlMessage,
+  reconcileCodexLinearMessages,
+} from "../lib/codexLinearMessages";
+import {
   getMessageId,
   mergeJSONLMessages,
   mergeStreamMessage,
@@ -103,95 +108,12 @@ function getMessageRole(message: Message): string {
   return "unknown";
 }
 
-function getNestedMessageContent(message: Message): unknown {
-  return (message.message as { content?: unknown } | undefined)?.content;
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || value === undefined) {
-    return String(value);
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  if (
-    typeof value === "number" ||
-    typeof value === "boolean" ||
-    typeof value === "bigint"
-  ) {
-    return String(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
-  }
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>).sort(
-      ([a], [b]) => a.localeCompare(b),
-    );
-    return `{${entries.map(([k, v]) => `${k}:${stableStringify(v)}`).join(",")}}`;
-  }
-  return String(value);
-}
-
-function normalizeContentBlock(block: unknown): string {
-  if (typeof block === "string") {
-    return `text:${block}`;
-  }
-
-  if (!block || typeof block !== "object") {
-    return "";
-  }
-
-  const typedBlock = block as Record<string, unknown>;
-  const type =
-    typeof typedBlock.type === "string" ? typedBlock.type : "unknown";
-
-  switch (type) {
-    case "text":
-    case "output_text":
-      return `text:${typeof typedBlock.text === "string" ? typedBlock.text : ""}`;
-
-    case "thinking":
-      return `thinking:${typeof typedBlock.thinking === "string" ? typedBlock.thinking : ""}`;
-
-    case "tool_use":
-      return `tool_use:${typeof typedBlock.id === "string" ? typedBlock.id : ""}:${typeof typedBlock.name === "string" ? typedBlock.name : ""}:${stableStringify(typedBlock.input)}`;
-
-    case "tool_result":
-      return `tool_result:${typeof typedBlock.tool_use_id === "string" ? typedBlock.tool_use_id : ""}:${typedBlock.is_error === true ? "1" : "0"}:${typeof typedBlock.content === "string" ? typedBlock.content : stableStringify(typedBlock.content)}`;
-
-    default:
-      return `${type}:${stableStringify(typedBlock)}`;
-  }
-}
-
-function getSemanticReplayFingerprint(message: Message): string | null {
-  const content = getNestedMessageContent(message);
-
-  let normalizedContent: string;
-  if (typeof content === "string") {
-    normalizedContent = `text:${content}`;
-  } else if (Array.isArray(content)) {
-    normalizedContent = content.map(normalizeContentBlock).join("|");
-  } else {
-    return null;
-  }
-
-  if (!normalizedContent.trim()) {
-    return null;
-  }
-
-  const type = typeof message.type === "string" ? message.type : "unknown";
-  const role = getMessageRole(message);
-  return `${type}|${role}|${normalizedContent}`;
-}
-
 function isEmptyAssistantContent(message: Message): boolean {
   if (message.type !== "assistant") {
     return false;
   }
 
-  const content = getNestedMessageContent(message);
+  const content = message.message?.content;
   if (typeof content === "string") {
     return content.trim().length === 0;
   }
@@ -219,39 +141,6 @@ function isEmptyAssistantContent(message: Message): boolean {
     }
     return false;
   });
-}
-
-function hasEquivalentJsonlMessage(
-  existing: Message[],
-  incoming: Message,
-): boolean {
-  const incomingFingerprint = getSemanticReplayFingerprint(incoming);
-  if (!incomingFingerprint) {
-    return false;
-  }
-
-  const maxScan = 400;
-  const startIndex = Math.max(0, existing.length - maxScan);
-
-  for (let i = existing.length - 1; i >= startIndex; i -= 1) {
-    const candidate = existing[i];
-    if (!candidate || candidate._source !== "jsonl") {
-      continue;
-    }
-    if (getSemanticReplayFingerprint(candidate) === incomingFingerprint) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function getMessageTimestampMs(message: Message): number | null {
-  if (typeof message.timestamp !== "string") {
-    return null;
-  }
-  const ms = Date.parse(message.timestamp);
-  return Number.isFinite(ms) ? ms : null;
 }
 
 /**
@@ -351,7 +240,9 @@ export function useSessionMessages(
         }
 
         const result = mergeStreamMessage(prev, incoming);
-        return result.messages;
+        return isCodexProvider(provider)
+          ? reconcileCodexLinearMessages(result.messages)
+          : result.messages;
       });
     },
     [],
@@ -416,7 +307,11 @@ export function useSessionMessages(
           _source: "jsonl" as const,
         }));
         updatePersistedTimestampWatermark(taggedMessages);
-        setMessages(taggedMessages);
+        setMessages(
+          isCodexProvider(data.session.provider)
+            ? reconcileCodexLinearMessages(taggedMessages)
+            : taggedMessages,
+        );
 
         // Update lastMessageIdRef synchronously to avoid race condition:
         // stream "connected" event calls fetchNewMessages() immediately, but the
@@ -559,7 +454,9 @@ export function useSessionMessages(
             skipDagOrdering: !getProvider(data.session.provider).capabilities
               .supportsDag,
           });
-          return result.messages;
+          return isCodexProvider(data.session.provider)
+            ? reconcileCodexLinearMessages(result.messages)
+            : result.messages;
         });
       }
       // Update session metadata (including title, model, contextUsage) which may have changed
@@ -591,7 +488,10 @@ export function useSessionMessages(
           _source: "jsonl" as const,
         }));
         updatePersistedTimestampWatermark(taggedOlder);
-        return [...taggedOlder, ...prev];
+        const combined = [...taggedOlder, ...prev];
+        return isCodexProvider(data.session.provider)
+          ? reconcileCodexLinearMessages(combined)
+          : combined;
       });
       setPagination(data.pagination);
     } catch {
